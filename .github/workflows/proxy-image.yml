@@ -45,7 +45,10 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # The full Stalwart release build exceeds the GitHub runner memory
+          # limit when cross-compiling the ARM64 target. The current kccolhub
+          # worker pool is AMD64, so publish that target explicitly.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
