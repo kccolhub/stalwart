@@ -29,10 +29,15 @@ const APP_BLOB_PREFIX: &str = "STALWART_APP_";
 const MAX_APP_SIZE: usize = 100 * 1024 * 1024;
 const BASE_HREF: &str = "<base href=\"/\"";
 const OAUTH_CLIENT_ID: &str = "<meta name=\"oauth-client-id\" content=\"\"";
+const HEAD_CLOSE: &str = "</head>";
+// Browser translation can mutate the DOM behind React's back and cause removeChild errors.
+const NOTRANSLATE_MARKER: &str = "name=\"google\" content=\"notranslate\"";
+const NOTRANSLATE_META: &str = "  <meta name=\"google\" content=\"notranslate\" />\n";
 
 enum IndexEdit<'x> {
     BaseHref(&'x str),
     OAuthClientId(&'x str),
+    NoTranslateMeta,
 }
 
 #[allow(clippy::type_complexity)]
@@ -450,6 +455,12 @@ impl Default for WebApplications {
 }
 
 fn rewrite_index(html: &str, prefix: &str, oauth_client_id_meta: Option<&str>) -> Vec<u8> {
+    let no_translate_meta = if html.contains(NOTRANSLATE_MARKER) {
+        None
+    } else {
+        html.find(HEAD_CLOSE)
+            .map(|at| (at, 0, IndexEdit::NoTranslateMeta))
+    };
     let mut edits = [
         html.find(BASE_HREF)
             .map(|at| (at, BASE_HREF.len(), IndexEdit::BaseHref(prefix))),
@@ -457,6 +468,7 @@ fn rewrite_index(html: &str, prefix: &str, oauth_client_id_meta: Option<&str>) -
             html.find(OAUTH_CLIENT_ID)
                 .map(|at| (at, OAUTH_CLIENT_ID.len(), IndexEdit::OAuthClientId(meta)))
         }),
+        no_translate_meta,
     ];
 
     if edits.iter().all(Option::is_none) {
@@ -477,6 +489,7 @@ fn rewrite_index(html: &str, prefix: &str, oauth_client_id_meta: Option<&str>) -
                 out.push_str("/\"");
             }
             IndexEdit::OAuthClientId(meta) => out.push_str(meta),
+            IndexEdit::NoTranslateMeta => out.push_str(NOTRANSLATE_META),
         }
         pos = at + len;
     }
@@ -520,6 +533,7 @@ mod tests {
             html.contains("<meta name=\"oauth-client-id\" content=\"stalwart-webui\" />"),
             "{html}"
         );
+        assert!(html.contains(NOTRANSLATE_META.trim()), "{html}");
         assert!(html.contains("<title>Portal</title>"), "{html}");
         assert!(html.starts_with("<!doctype html>"), "{html}");
         assert!(html.ends_with("</html>\n"), "{html}");
@@ -534,15 +548,19 @@ mod tests {
             html.contains("<meta name=\"oauth-client-id\" content=\"\" />"),
             "{html}"
         );
+        assert!(html.contains(NOTRANSLATE_META.trim()), "{html}");
     }
 
     #[test]
-    fn index_without_a_placeholder_is_left_alone() {
+    fn index_without_a_placeholder_still_gets_notranslate_meta() {
         let bundle = "<head>\n  <base href=\"/\" />\n</head>";
         let meta = oauth_client_id_meta("stalwart-webui");
         let html = String::from_utf8(rewrite_index(bundle, "admin", Some(&meta))).unwrap();
 
-        assert_eq!(html, "<head>\n  <base href=\"/admin/\" />\n</head>");
+        assert_eq!(
+            html,
+            "<head>\n  <base href=\"/admin/\" />\n  <meta name=\"google\" content=\"notranslate\" />\n</head>"
+        );
     }
 
     #[test]
@@ -558,7 +576,7 @@ mod tests {
             html,
             concat!(
                 "<head><meta name=\"oauth-client-id\" content=\"app\" />",
-                "<base href=\"/admin/\" /></head>"
+                "<base href=\"/admin/\" />  <meta name=\"google\" content=\"notranslate\" />\n</head>"
             )
         );
     }
@@ -672,8 +690,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unmodified_document_is_returned_verbatim() {
+    fn index_without_other_edits_gets_notranslate_meta() {
         let bundle = "<head><title>x</title></head>";
+
+        assert_eq!(
+            String::from_utf8(rewrite_index(bundle, "admin", None)).unwrap(),
+            "<head><title>x</title>  <meta name=\"google\" content=\"notranslate\" />\n</head>"
+        );
+    }
+
+    #[test]
+    fn existing_notranslate_meta_is_not_duplicated() {
+        let bundle = "<head><meta name=\"google\" content=\"notranslate\" /></head>";
 
         assert_eq!(rewrite_index(bundle, "admin", None), bundle.as_bytes());
     }
