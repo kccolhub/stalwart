@@ -16,7 +16,11 @@ ahash = { version = "0.8", features = ["serde"] }
 chrono = "0.4"
 aws-lc-rs = { version = "1" }
 base64 = "0.23"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"]}
+# Keep system proxy support enabled even though the default feature set is
+# disabled. This allows HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (including
+# socks5/socks5h URLs when the `socks` feature is enabled) to be used by all
+# outbound HTTP clients built through this crate.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "system-proxy", "socks"]}
 futures = "0.3"
 form_urlencoded = "1.2.2"
 psl = "2"
