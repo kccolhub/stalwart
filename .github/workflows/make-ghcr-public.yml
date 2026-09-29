@@ -1,0 +1,17 @@
+name: Make GHCR image public
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  visibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set package visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: gh api --method PATCH "/orgs/${OWNER}/packages/container/stalwart" -f visibility=public
