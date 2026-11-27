@@ -5,7 +5,12 @@
  */
 
 use crate::api::IntoPushObject;
-use common::{LONG_1D_SLUMBER, Server, auth::AccessToken, ipc::PushNotification};
+use common::{
+    BuildServer, LONG_1D_SLUMBER, Server,
+    auth::AccessToken,
+    cache::http_auth::RevocationEpoch,
+    ipc::{PushNotification, ViewerStateChange},
+};
 use http_body_util::{StreamBody, combinators::BoxBody};
 use http_proto::*;
 use hyper::{
@@ -14,7 +19,8 @@ use hyper::{
 };
 use jmap_proto::{response::status::PushObject, types::state::State};
 use std::time::{Duration, Instant};
-use std::{future::Future, str::FromStr};
+use std::{future::Future, net::IpAddr, str::FromStr};
+use sync_wrapper::SyncFuture;
 use types::{id::Id, type_state::DataType};
 use utils::map::{bitmap::Bitmap, vec_map::VecMap};
 
@@ -29,6 +35,8 @@ pub trait EventSourceHandler: Sync + Send {
         &self,
         req: HttpRequest,
         access_token: AccessToken,
+        epoch: RevocationEpoch,
+        remote_ip: IpAddr,
     ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
 }
 
@@ -36,7 +44,9 @@ impl EventSourceHandler for Server {
     async fn handle_event_source(
         &self,
         req: HttpRequest,
-        access_token: AccessToken,
+        mut access_token: AccessToken,
+        mut revocation_epoch: RevocationEpoch,
+        remote_ip: IpAddr,
     ) -> trc::Result<HttpResponse> {
         // Parse query
         let mut ping = 0;
@@ -77,9 +87,9 @@ impl EventSourceHandler for Server {
         }
 
         let mut ping = if ping > 0 {
-            #[cfg(not(feature = "test_mode"))]
+            #[cfg(not(stalwart_tests))]
             let interval = std::cmp::max(ping, 30);
-            #[cfg(feature = "test_mode")]
+            #[cfg(stalwart_tests)]
             let interval = ping;
             let interval_duration = Duration::from_secs(interval as u64);
 
@@ -97,7 +107,10 @@ impl EventSourceHandler for Server {
         };
 
         // Register with push manager
-        let mut push_rx = self.subscribe_push_manager(&access_token, types).await?;
+        let requested_types = types;
+        access_token.restrict_data_types(&mut types);
+        let mut push_rx = self.subscribe_push_manager(&access_token, types);
+        let inner = self.inner.clone();
         let mut changed: VecMap<Id, VecMap<DataType, State>> = VecMap::new();
         let throttle = self.core.jmap.event_source_throttle;
 
@@ -108,16 +121,50 @@ impl EventSourceHandler for Server {
                 let mut last_message = Instant::now() - throttle;
                 let mut timeout =
                     ping.as_ref().map(|p| p.interval).unwrap_or(LONG_1D_SLUMBER);
+                let mut notifications = Vec::new();
 
                 loop {
-                    match tokio::time::timeout(timeout, push_rx.recv()).await {
-                        Ok(Some(notification)) => {
+                    let received = tokio::time::timeout(timeout, push_rx.recv(&mut notifications)).await;
+
+                    let server = inner.build_server();
+                    let renewal = match access_token
+                        .grant_id()
+                        .map(|_| server.inner.cache.grant_revocations.epoch())
+                    {
+                        Some(epoch) if epoch != revocation_epoch => {
+                            SyncFuture::new(server.renew_access_token(&access_token, remote_ip))
+                                .await
+                                .map(|renewed| {
+                                    revocation_epoch = epoch;
+                                    Some(renewed)
+                                })
+                        }
+                        _ => SyncFuture::new(server.refresh_access_token(&access_token, remote_ip)).await,
+                    };
+                    match renewal {
+                        Ok(Some(renewed)) => {
+                            let mut renewed_types = requested_types;
+                            renewed.restrict_data_types(&mut renewed_types);
+                            if renewed_types != types || !renewed.member_ids().eq(access_token.member_ids()) {
+                                break;
+                            }
+                            access_token = renewed;
+                        }
+                        Ok(None) => (),
+                        Err(_) => break,
+                    }
+
+                    match received {
+                        Ok(true) => for notification in notifications.drain(..) {
                             match notification {
-                                PushNotification::StateChange(state_change) => {
+                                PushNotification::StateChange(state_change)
+                                | PushNotification::ViewerStateChange(ViewerStateChange {
+                                    change: state_change,
+                                    ..
+                                }) => {
+                                    let states = changed.get_mut_or_insert(state_change.account_id.into());
                                     for type_state in state_change.types {
-                                        changed
-                                            .get_mut_or_insert(state_change.account_id.into())
-                                            .set(type_state, State::Exact(state_change.change_id));
+                                        states.set(type_state, State::Exact(state_change.change_id));
                                     }
                                 }
                                 PushNotification::CalendarAlert(calendar_alert) => {
@@ -128,15 +175,14 @@ impl EventSourceHandler for Server {
                                 }
                                 PushNotification::EmailPush(email_push) => {
                                     let state_change = email_push.to_state_change();
+                                    let states = changed.get_mut_or_insert(state_change.account_id.into());
                                     for type_state in state_change.types {
-                                        changed
-                                            .get_mut_or_insert(state_change.account_id.into())
-                                            .set(type_state, State::Exact(state_change.change_id));
+                                        states.set(type_state, State::Exact(state_change.change_id));
                                     }
                                 }
                             }
-                        }
-                        Ok(None) => {
+                        },
+                        Ok(false) => {
                             break;
                         }
                         Err(_) => (),

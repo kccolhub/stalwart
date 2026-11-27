@@ -13,8 +13,10 @@ use crate::{
 use common::{
     DAEMON_NAME,
     config::smtp::session::{Milter, Stage},
+    expr::Bump,
     network::SessionStream,
 };
+use compact_str::ToCompactString;
 use mail_auth::AuthenticatedMessage;
 use smtp_proto::{IntoString, request::parser::Rfc5321Parser};
 use std::{borrow::Cow, time::Instant};
@@ -22,7 +24,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use trc::MilterEvent;
 use utils::DomainPart;
 
-enum Rejection {
+enum Interrupt {
+    Accept,
     Action(Action),
     Error(Error),
 }
@@ -40,11 +43,12 @@ impl<T: SessionStream> Session<T> {
         }
 
         let mut modifications = Vec::new();
+        let mut arena = Bump::new();
         for milter in milters {
             if !milter.run_on_stage.contains(&stage)
                 || !self
                     .server
-                    .eval_if(&milter.enable, self, self.data.session_id)
+                    .eval_if(&milter.enable, self, &mut arena, self.data.session_id)
                     .await
                     .unwrap_or(false)
             {
@@ -53,11 +57,19 @@ impl<T: SessionStream> Session<T> {
 
             let time = Instant::now();
             match self.connect_and_run(milter, message).await {
+                Err(Interrupt::Accept) => {
+                    trc::event!(
+                        Milter(MilterEvent::ActionAccept),
+                        SpanId = self.data.session_id,
+                        Name = milter.id.to_compact_string(),
+                        Elapsed = time.elapsed(),
+                    );
+                }
                 Ok(new_modifications) => {
                     trc::event!(
                         Milter(MilterEvent::ActionAccept),
                         SpanId = self.data.session_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Elapsed = time.elapsed(),
                     );
 
@@ -76,7 +88,7 @@ impl<T: SessionStream> Session<T> {
                         modifications = new_modifications;
                     }
                 }
-                Err(Rejection::Action(action)) => {
+                Err(Interrupt::Action(action)) => {
                     trc::event!(
                         Milter(match &action {
                             Action::Discard => MilterEvent::ActionDiscard,
@@ -91,7 +103,7 @@ impl<T: SessionStream> Session<T> {
                         }),
                         SpanId = self.data.session_id,
                         QueueId = queue_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Elapsed = time.elapsed(),
                     );
 
@@ -117,11 +129,12 @@ impl<T: SessionStream> Session<T> {
                         Action::Accept | Action::Continue => unreachable!(),
                     });
                 }
-                Err(Rejection::Error(err)) => {
+                Err(Interrupt::Error(err)) => {
                     let (code, details) = match err {
-                        Error::Io(details) => {
-                            (MilterEvent::IoError, trc::Value::from(details.to_string()))
-                        }
+                        Error::Io(details) => (
+                            MilterEvent::IoError,
+                            trc::Value::from(details.to_compact_string()),
+                        ),
                         Error::FrameTooLarge(size) => {
                             (MilterEvent::FrameTooLarge, trc::Value::from(size))
                         }
@@ -130,7 +143,7 @@ impl<T: SessionStream> Session<T> {
                         }
                         Error::Unexpected(response) => (
                             MilterEvent::UnexpectedResponse,
-                            trc::Value::from(response.to_string()),
+                            trc::Value::from(response.to_compact_string()),
                         ),
                         Error::Timeout => (MilterEvent::Timeout, trc::Value::None),
                         Error::TLSInvalidName => (MilterEvent::TlsInvalidName, trc::Value::None),
@@ -140,7 +153,7 @@ impl<T: SessionStream> Session<T> {
                     trc::event!(
                         Milter(code),
                         SpanId = self.data.session_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Details = details,
                         Elapsed = time.elapsed(),
                     );
@@ -159,7 +172,7 @@ impl<T: SessionStream> Session<T> {
         &self,
         milter: &Milter,
         message: Option<&AuthenticatedMessage<'_>>,
-    ) -> Result<Vec<Modification>, Rejection> {
+    ) -> Result<Vec<Modification>, Interrupt> {
         // Build client
         let client = MilterClient::connect(milter, self.data.session_id).await?;
         if !milter.tls {
@@ -186,7 +199,19 @@ impl<T: SessionStream> Session<T> {
         &self,
         mut client: MilterClient<S>,
         message: Option<&AuthenticatedMessage<'_>>,
-    ) -> Result<Vec<Modification>, Rejection> {
+    ) -> Result<Vec<Modification>, Interrupt> {
+        let result = self.run_stages(&mut client, message).await;
+        if !matches!(result, Err(Interrupt::Error(_))) {
+            let _ = client.quit().await;
+        }
+        result
+    }
+
+    async fn run_stages<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        client: &mut MilterClient<S>,
+        message: Option<&AuthenticatedMessage<'_>>,
+    ) -> Result<Vec<Modification>, Interrupt> {
         // Option negotiation
         client.init().await?;
 
@@ -214,16 +239,18 @@ impl<T: SessionStream> Session<T> {
             .assert_continue()?;
 
         // EHLO/HELO
-        let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
-        client
-            .helo(
-                &self.data.helo_domain,
-                Macros::new()
-                    .with_cipher(tls_cipher.as_ref())
-                    .with_tls_version(tls_version.as_ref()),
-            )
-            .await?
-            .assert_continue()?;
+        if !self.data.helo_domain.is_empty() {
+            let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
+            client
+                .helo(
+                    &self.data.helo_domain,
+                    Macros::new()
+                        .with_cipher(tls_cipher.as_ref())
+                        .with_tls_version(tls_version.as_ref()),
+                )
+                .await?
+                .assert_continue()?;
+        }
 
         // Mail from
         if let Some(mail_from) = &self.data.mail_from {
@@ -262,28 +289,17 @@ impl<T: SessionStream> Session<T> {
 
             // Headers
             client
-                .headers(message.raw_parsed_headers().iter().map(|(k, v)| {
-                    (
-                        std::str::from_utf8(k).unwrap_or_default(),
-                        std::str::from_utf8(v).unwrap_or_default(),
-                    )
-                }))
+                .headers(message.headers().iter().copied())
                 .await?
                 .assert_continue()?;
 
             // Message body
-            let (action, modifications) = client.body(message.raw_message()).await?;
-            action.assert_continue()?;
-
-            // Quit
-            let _ = client.quit().await;
-
-            // Return modifications
-            Ok(modifications)
+            let (action, modifications) = client.body(message.raw_body()).await?;
+            match action {
+                Action::Accept | Action::Continue => Ok(modifications),
+                action => Err(Interrupt::Action(action)),
+            }
         } else {
-            // Quit
-            let _ = client.quit().await;
-
             Ok(Vec::new())
         }
     }
@@ -296,8 +312,14 @@ impl SessionData {
         message: &AuthenticatedMessage<'_>,
     ) -> Option<Vec<u8>> {
         let mut body = Vec::new();
-        let mut header_changes = Vec::new();
-        let mut needs_rewrite = false;
+        let mut headers = None;
+        let original_headers = || {
+            message
+                .headers()
+                .iter()
+                .map(|(name, value)| (Cow::Borrowed(*name), Cow::Borrowed(*value)))
+                .collect::<Vec<_>>()
+        };
 
         for modification in modifications {
             match modification {
@@ -326,7 +348,7 @@ impl SessionData {
                                     Milter(MilterEvent::ParseError),
                                     SpanId = self.session_id,
                                     Details = "Failed to parse milter mailFrom parameters",
-                                    Reason = err.to_string(),
+                                    Reason = err.to_compact_string(),
                                 );
                             }
                         }
@@ -362,7 +384,7 @@ impl SessionData {
                                         Milter(MilterEvent::ParseError),
                                         SpanId = self.session_id,
                                         Details = "Failed to parse milter rcptTo parameters",
-                                        Reason = err.to_string(),
+                                        Reason = err.to_compact_string(),
                                     );
                                 }
                             }
@@ -378,36 +400,71 @@ impl SessionData {
                     self.rcpt_to.retain(|r| r.address_lcase != recipient);
                 }
                 Modification::ReplaceBody { value } => {
-                    body.extend(value);
+                    if body.is_empty() {
+                        body = value;
+                    } else {
+                        body.extend(value);
+                    }
                 }
                 Modification::AddHeader { name, value } => {
-                    header_changes.push((0, name, value, false));
+                    headers.get_or_insert_with(original_headers).push((
+                        Cow::Owned(name.into_bytes()),
+                        Cow::Owned(milter_header_value(&value)),
+                    ));
                 }
                 Modification::InsertHeader { index, name, value } => {
-                    header_changes.push((index, name, value, false));
-                    needs_rewrite = true;
+                    let headers = headers.get_or_insert_with(original_headers);
+                    let pos = usize::try_from(index)
+                        .unwrap_or(usize::MAX)
+                        .min(headers.len());
+                    headers.insert(
+                        pos,
+                        (
+                            Cow::Owned(name.into_bytes()),
+                            Cow::Owned(milter_header_value(&value)),
+                        ),
+                    );
                 }
                 Modification::ChangeHeader { index, name, value } => {
-                    if value.is_empty()
-                        || message
-                            .raw_parsed_headers()
-                            .iter()
-                            .any(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
-                    {
-                        header_changes.push((index, name, value, true));
-                        needs_rewrite = true;
-                    } else {
-                        header_changes.push((0, name, value, false));
+                    let headers = headers.get_or_insert_with(original_headers);
+                    let occurrence = usize::try_from(index).unwrap_or(usize::MAX).max(1);
+                    let pos = headers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (header, _))| header.eq_ignore_ascii_case(name.as_bytes()))
+                        .nth(occurrence - 1)
+                        .map(|(pos, _)| pos);
+                    match pos {
+                        Some(pos) if value.is_empty() => {
+                            headers.remove(pos);
+                        }
+                        Some(pos) => {
+                            if let Some((_, header_value)) = headers.get_mut(pos) {
+                                *header_value = Cow::Owned(milter_header_value(&value));
+                            }
+                        }
+                        None if !value.is_empty() => {
+                            headers.push((
+                                Cow::Owned(name.into_bytes()),
+                                Cow::Owned(milter_header_value(&value)),
+                            ));
+                        }
+                        None => {}
                     }
                 }
                 Modification::Quarantine { reason } => {
-                    header_changes.push((0, "X-Quarantine".into(), reason, false));
+                    headers.get_or_insert_with(original_headers).insert(
+                        0,
+                        (
+                            Cow::Borrowed(b"X-Quarantine"),
+                            Cow::Owned(milter_header_value(reason.as_bytes())),
+                        ),
+                    );
                 }
             }
         }
 
-        // If there are no header changes return
-        if header_changes.is_empty() {
+        let Some(headers) = headers else {
             return if !body.is_empty() {
                 let mut new_message = Vec::with_capacity(body.len() + message.raw_headers().len());
                 new_message.extend_from_slice(message.raw_headers());
@@ -416,123 +473,74 @@ impl SessionData {
             } else {
                 None
             };
-        }
+        };
 
         let new_body = if !body.is_empty() {
             &body[..]
         } else {
             message.raw_body()
         };
-
-        if needs_rewrite {
-            let mut headers = message
-                .raw_parsed_headers()
-                .iter()
-                .map(|(h, v)| (Cow::from(*h), Cow::from(*v)))
-                .collect::<Vec<_>>();
-
-            // Perform changes
-            for (index, header_name, header_value, is_change) in header_changes {
-                if is_change {
-                    let mut header_count = 0;
-                    for (pos, (name, value)) in headers.iter_mut().enumerate() {
-                        if name.eq_ignore_ascii_case(header_name.as_bytes()) {
-                            header_count += 1;
-                            if header_count == index {
-                                if !header_value.is_empty() {
-                                    *value = Cow::from(header_value.as_bytes().to_vec());
-                                } else {
-                                    headers.remove(pos);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    let mut header_pos = 0;
-                    if index > 0 {
-                        let mut header_count = 0;
-                        for (pos, (name, _)) in headers.iter().enumerate() {
-                            if name.eq_ignore_ascii_case(header_name.as_bytes()) {
-                                header_pos = pos;
-                                header_count += 1;
-                                if header_count == index {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    headers.insert(
-                        header_pos,
-                        (
-                            Cow::from(header_name.as_bytes().to_vec()),
-                            Cow::from(header_value.as_bytes().to_vec()),
-                        ),
-                    );
-                }
+        let mut new_message = Vec::with_capacity(
+            new_body.len()
+                + headers
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len() + 3)
+                    .sum::<usize>()
+                + 2,
+        );
+        for (name, value) in headers {
+            new_message.extend_from_slice(&name);
+            new_message.push(b':');
+            new_message.extend_from_slice(&value);
+            if !value.ends_with(b"\n") {
+                new_message.extend_from_slice(b"\r\n");
             }
-
-            // Write new headers
-            let mut new_message = Vec::with_capacity(
-                new_body.len()
-                    + message.raw_headers().len()
-                    + headers
-                        .iter()
-                        .map(|(h, v)| h.len() + v.len() + 4)
-                        .sum::<usize>(),
-            );
-            for (header, value) in headers {
-                new_message.extend_from_slice(header.as_ref());
-                if value.first().is_some_and(|c| c.is_ascii_whitespace()) {
-                    new_message.extend_from_slice(b":");
-                } else {
-                    new_message.extend_from_slice(b": ");
-                }
-                new_message.extend_from_slice(value.as_ref());
-                if value.last().is_none_or(|c| *c != b'\n') {
-                    new_message.extend_from_slice(b"\r\n");
-                }
-            }
-            new_message.extend_from_slice(b"\r\n");
-            new_message.extend(new_body);
-            Some(new_message)
-        } else {
-            let mut new_message = Vec::with_capacity(
-                new_body.len()
-                    + message.raw_headers().len()
-                    + header_changes
-                        .iter()
-                        .map(|(_, h, v, _)| h.len() + v.len() + 4)
-                        .sum::<usize>(),
-            );
-            for (_, header, value, _) in header_changes {
-                new_message.extend_from_slice(header.as_bytes());
-                new_message.extend_from_slice(b": ");
-                new_message.extend_from_slice(value.as_bytes());
-                if !value.ends_with('\n') {
-                    new_message.extend_from_slice(b"\r\n");
-                }
-            }
-            new_message.extend_from_slice(message.raw_headers());
-            new_message.extend(new_body);
-            Some(new_message)
         }
+        new_message.extend_from_slice(b"\r\n");
+        new_message.extend_from_slice(new_body);
+        Some(new_message)
     }
+}
+
+fn milter_header_value(value: &[u8]) -> Vec<u8> {
+    let mut value = value;
+    while let [rest @ .., b'\r' | b'\n'] = value {
+        value = rest;
+    }
+    let mut out = Vec::with_capacity(value.len() + 4);
+    if !matches!(value.first(), Some(b' ' | b'\t')) {
+        out.push(b' ');
+    }
+    let mut lines = value
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    if let Some(first) = lines.next() {
+        out.extend_from_slice(first);
+    }
+    for line in lines.filter(|line| !line.is_empty()) {
+        out.extend_from_slice(b"\r\n");
+        if !matches!(line.first(), Some(b' ' | b'\t')) {
+            out.push(b'\t');
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 impl Action {
-    fn assert_continue(self) -> Result<(), Rejection> {
+    fn assert_continue(self) -> Result<(), Interrupt> {
         match self {
-            Action::Continue | Action::Accept => Ok(()),
-            action => Err(Rejection::Action(action)),
+            Action::Continue => Ok(()),
+            Action::Accept => Err(Interrupt::Accept),
+            action => Err(Interrupt::Action(action)),
         }
     }
 }
 
-impl From<Error> for Rejection {
+impl From<Error> for Interrupt {
     fn from(err: Error) -> Self {
-        Rejection::Error(err)
+        Interrupt::Error(err)
     }
 }
 

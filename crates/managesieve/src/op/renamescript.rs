@@ -6,13 +6,14 @@
 
 use crate::core::{Command, ResponseCode, Session, StatusResponse};
 use common::{network::SessionStream, storage::index::ObjectIndexBuilder};
-use email::sieve::SieveScript;
+use compact_str::format_compact;
+use email::sieve::{SieveScript, rules::is_managed_script};
 use imap_proto::receiver::Request;
 use registry::schema::enums::Permission;
 use std::time::Instant;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::{Archive, ArchiveBytes, BatchBuilder},
 };
 use trc::AddContext;
 use types::collection::Collection;
@@ -49,12 +50,19 @@ impl<T: SessionStream> Session<T> {
         if name == new_name {
             return Ok(StatusResponse::ok("Old and new script names are the same.").into_bytes());
         }
+        if is_managed_script(&name) {
+            return Err(trc::ManageSieveEvent::Error.into_err().details(
+                "The 'managed' script is read-only, use VacationResponse or x:MailRule instead.",
+            ));
+        }
         let account_id = self.state.access_token().account_id();
         let document_id = self.get_script_id(account_id, &name).await?;
         if self.validate_name(account_id, &new_name).await?.is_some() {
             return Err(trc::ManageSieveEvent::Error
                 .into_err()
-                .details(format!("A sieve script with name '{name}' already exists.",))
+                .details(format_compact!(
+                    "A sieve script with name '{name}' already exists.",
+                ))
                 .code(ResponseCode::AlreadyExists));
         }
 
@@ -62,7 +70,7 @@ impl<T: SessionStream> Session<T> {
         let script = self
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 account_id,
                 Collection::SieveScript,
                 document_id,
@@ -100,7 +108,7 @@ impl<T: SessionStream> Session<T> {
         trc::event!(
             ManageSieve(trc::ManageSieveEvent::RenameScript),
             SpanId = self.session_id,
-            Id = new_name,
+            Script = new_name,
             DocumentId = document_id,
             Elapsed = op_start.elapsed()
         );

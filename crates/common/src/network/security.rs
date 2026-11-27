@@ -7,19 +7,24 @@
 use crate::{
     KV_RATE_LIMIT_AUTH, KV_RATE_LIMIT_LOITER, KV_RATE_LIMIT_RCPT, KV_RATE_LIMIT_SCAN, Server,
     ipc::{BroadcastEvent, RegistryChange},
-    network::ip_to_bytes,
+    network::{IPV6_PREFIX_MASK, ip_rate_key, ipv6_prefix},
 };
 use ahash::AHashSet;
 use registry::{
     schema::{
         enums::{BlockReason, PasswordHashAlgorithm, PasswordStrength},
-        prelude::{Object, ObjectType},
+        prelude::{Object, ObjectInner, ObjectType},
         structs::{self, AllowedIp, BlockedIp, Rate, SystemSettings},
     },
     types::{datetime::UTCDateTime, ipmask::IpAddrOrMask},
 };
-use std::{fmt::Debug, hash::Hash, net::IpAddr};
+use std::{
+    fmt::Debug,
+    hash::Hash,
+    net::{IpAddr, Ipv6Addr},
+};
 use store::{
+    blake3,
     registry::{
         bootstrap::Bootstrap,
         write::{RegistryWrite, RegistryWriteResult},
@@ -50,7 +55,12 @@ pub struct Security {
 
     pub default_role_ids_user: Vec<Id>,
     pub default_role_ids_group: Vec<Id>,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub default_role_ids_tenant: Vec<Id>,
+    // SPDX-SnippetEnd
     pub default_role_ids_admin: Vec<Id>,
 
     pub password_hash_algorithm: PasswordHashAlgorithm,
@@ -63,6 +73,7 @@ pub struct Security {
 #[derive(Default)]
 pub struct BlockedIps {
     pub blocked_ip_addresses: AHashSet<IpWithTtl<IpAddr>>,
+    pub blocked_ipv6_prefixes: AHashSet<IpWithTtl<Ipv6Addr>>,
     pub blocked_ip_networks: Vec<IpWithTtl<IpAddrOrMask>>,
     pub has_blocked_networks: bool,
 }
@@ -141,14 +152,14 @@ impl Security {
 
             trc::event!(
                 Security(trc::SecurityEvent::IpAllowExpired),
-                Details = expired_allows
+                Ip = expired_allows
                     .into_iter()
                     .map(|(_, ip, _)| trc::Value::from(ip.into_inner().0))
                     .collect::<Vec<_>>()
             );
         }
 
-        #[cfg(not(feature = "test_mode"))]
+        #[cfg(not(stalwart_tests))]
         {
             // Add loopback addresses
             allowed_ip_addresses.insert(IpWithTtl::new(
@@ -187,12 +198,17 @@ impl Security {
             scanner_fail_rate: security.scan_ban_rate.filter(|_| !is_recovery_mode),
             default_role_ids_user: auth.default_user_role_ids.into_inner(),
             default_role_ids_group: auth.default_group_role_ids.into_inner(),
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
             default_role_ids_tenant: auth.default_tenant_role_ids.into_inner(),
+            // SPDX-SnippetEnd
             default_role_ids_admin: auth.default_admin_role_ids.into_inner(),
             password_hash_algorithm: auth.password_hash_algorithm,
-            password_max_length: auth.password_max_length as u32,
-            password_min_length: auth.password_min_length as u32,
-            password_min_strength: match auth.password_min_strength {
+            password_max_length: auth.max_password_length as u32,
+            password_min_length: auth.min_password_length as u32,
+            password_min_strength: match auth.min_password_strength {
                 PasswordStrength::Zero => Score::Zero,
                 PasswordStrength::One => Score::One,
                 PasswordStrength::Two => Score::Two,
@@ -212,28 +228,50 @@ impl Security {
             BlockReason::Manual | BlockReason::Other => None,
         }
     }
+
+    pub fn is_default_role(&self, role_id: u32) -> bool {
+        let contains = |ids: &[Id]| ids.iter().any(|id| id.document_id() == role_id);
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        if contains(&self.default_role_ids_tenant) {
+            return true;
+        }
+        // SPDX-SnippetEnd
+        contains(&self.default_role_ids_user)
+            || contains(&self.default_role_ids_group)
+            || contains(&self.default_role_ids_admin)
+    }
 }
 
 impl Server {
     pub async fn is_rcpt_fail2banned(&self, ip: IpAddr, rcpt: &str) -> trc::Result<bool> {
-        if let Some(rate) = &self.core.network.security.rcpt_fail_rate {
-            let is_allowed = self.is_ip_allowed(ip)
-                || (self
-                    .in_memory_store()
-                    .is_rate_allowed(KV_RATE_LIMIT_RCPT, &ip_to_bytes(&ip), rate, false)
+        if let Some(rate) = &self.core.network.security.rcpt_fail_rate
+            && !self.is_ip_allowed(ip)
+        {
+            let store = self.in_memory_store();
+            let ip_key = ip_rate_key(&ip);
+            let rcpt_key = blake3::hash(rcpt.as_bytes());
+            let is_allowed = store
+                .is_rate_allowed(KV_RATE_LIMIT_RCPT, &ip_key, rate)
+                .await?
+                .is_none()
+                && store
+                    .is_rate_allowed(KV_RATE_LIMIT_RCPT, rcpt_key.as_bytes(), rate)
                     .await?
-                    .is_none()
-                    && self
-                        .in_memory_store()
-                        .is_rate_allowed(KV_RATE_LIMIT_RCPT, rcpt.as_bytes(), rate, false)
-                        .await?
-                        .is_none());
+                    .is_none();
 
             if !is_allowed {
                 return self
-                    .block_ip(ip, BlockReason::RcptToFailure)
-                    .await
-                    .map(|_| true);
+                    .ban_and_reset(
+                        ip,
+                        BlockReason::RcptToFailure,
+                        KV_RATE_LIMIT_RCPT,
+                        rate,
+                        &[ip_key.as_slice(), rcpt_key.as_bytes()],
+                    )
+                    .await;
             }
         }
 
@@ -242,22 +280,11 @@ impl Server {
 
     pub async fn is_scanner_fail2banned(&self, ip: IpAddr) -> trc::Result<bool> {
         if let Some(rate) = &self.core.network.security.scanner_fail_rate {
-            let is_allowed = self.is_ip_allowed(ip)
-                || self
-                    .in_memory_store()
-                    .is_rate_allowed(KV_RATE_LIMIT_SCAN, &ip_to_bytes(&ip), rate, false)
-                    .await?
-                    .is_none();
-
-            if !is_allowed {
-                return self
-                    .block_ip(ip, BlockReason::PortScanning)
-                    .await
-                    .map(|_| true);
-            }
+            self.is_ip_fail2banned(ip, KV_RATE_LIMIT_SCAN, rate, BlockReason::PortScanning)
+                .await
+        } else {
+            Ok(false)
         }
-
-        Ok(false)
     }
 
     pub async fn is_http_banned_path(&self, path: &str, ip: IpAddr) -> trc::Result<bool> {
@@ -274,44 +301,102 @@ impl Server {
 
     pub async fn is_loiter_fail2banned(&self, ip: IpAddr) -> trc::Result<bool> {
         if let Some(rate) = &self.core.network.security.loiter_fail_rate {
-            let is_allowed = self.is_ip_allowed(ip)
-                || self
-                    .in_memory_store()
-                    .is_rate_allowed(KV_RATE_LIMIT_LOITER, &ip_to_bytes(&ip), rate, false)
-                    .await?
-                    .is_none();
+            self.is_ip_fail2banned(ip, KV_RATE_LIMIT_LOITER, rate, BlockReason::Loitering)
+                .await
+        } else {
+            Ok(false)
+        }
+    }
 
-            if !is_allowed {
-                return self
-                    .block_ip(ip, BlockReason::Loitering)
-                    .await
-                    .map(|_| true);
-            }
+    async fn is_ip_fail2banned(
+        &self,
+        ip: IpAddr,
+        prefix: u8,
+        rate: &Rate,
+        reason: BlockReason,
+    ) -> trc::Result<bool> {
+        if self.is_ip_allowed(ip) {
+            return Ok(false);
         }
 
-        Ok(false)
+        let ip_key = ip_rate_key(&ip);
+        if self
+            .in_memory_store()
+            .is_rate_allowed(prefix, &ip_key, rate)
+            .await?
+            .is_none()
+        {
+            Ok(false)
+        } else {
+            self.ban_and_reset(ip, reason, prefix, rate, &[ip_key.as_slice()])
+                .await
+        }
+    }
+
+    async fn ban_and_reset(
+        &self,
+        ip: IpAddr,
+        reason: BlockReason,
+        prefix: u8,
+        rate: &Rate,
+        keys: &[&[u8]],
+    ) -> trc::Result<bool> {
+        self.block_ip(ip, reason).await?;
+        for key in keys {
+            if let Err(err) = self.in_memory_store().rate_reset(prefix, key, rate).await {
+                trc::error!(
+                    err.details("Failed to reset fail2ban counter")
+                        .caused_by(trc::location!())
+                );
+            }
+        }
+        Ok(true)
     }
 
     pub async fn is_auth_fail2banned(&self, ip: IpAddr, login: Option<&str>) -> trc::Result<bool> {
-        if let Some(rate) = &self.core.network.security.auth_fail_rate {
-            let login = login.unwrap_or_default();
-            let is_allowed = self.is_ip_allowed(ip)
-                || (self
-                    .in_memory_store()
-                    .is_rate_allowed(KV_RATE_LIMIT_AUTH, &ip_to_bytes(&ip), rate, false)
-                    .await?
-                    .is_none()
-                    && (login.is_empty()
-                        || self
-                            .in_memory_store()
-                            .is_rate_allowed(KV_RATE_LIMIT_AUTH, login.as_bytes(), rate, false)
-                            .await?
-                            .is_none()));
-            if !is_allowed {
+        if let Some(rate) = &self.core.network.security.auth_fail_rate
+            && !self.is_ip_allowed(ip)
+        {
+            let store = self.in_memory_store();
+            let ip_key = ip_rate_key(&ip);
+            if store
+                .is_rate_allowed(KV_RATE_LIMIT_AUTH, &ip_key, rate)
+                .await?
+                .is_some()
+            {
                 return self
-                    .block_ip(ip, BlockReason::AuthFailure)
-                    .await
-                    .map(|_| true);
+                    .ban_and_reset(
+                        ip,
+                        BlockReason::AuthFailure,
+                        KV_RATE_LIMIT_AUTH,
+                        rate,
+                        &[ip_key.as_slice()],
+                    )
+                    .await;
+            }
+
+            if let Some(login) = login.filter(|login| !login.is_empty())
+                && let Some(expires_in) = store
+                    .is_rate_allowed(
+                        KV_RATE_LIMIT_AUTH,
+                        blake3::hash(login.as_bytes()).as_bytes(),
+                        rate,
+                    )
+                    .await?
+            {
+                let period = self
+                    .core
+                    .network
+                    .security
+                    .auth_ban_period
+                    .map_or(expires_in, |period| period.min(expires_in));
+                self.block_address(
+                    IpAddrOrMask::from_ip(ip.to_canonical()),
+                    BlockReason::AuthFailure,
+                    Some(period),
+                )
+                .await?;
+                return Ok(true);
             }
         }
 
@@ -319,37 +404,79 @@ impl Server {
     }
 
     pub async fn block_ip(&self, ip: IpAddr, reason: BlockReason) -> trc::Result<()> {
-        // Add IP to blocked list
+        let address = match ip.to_canonical() {
+            IpAddr::V6(addr) => IpAddrOrMask::V6 {
+                addr: ipv6_prefix(addr),
+                mask: IPV6_PREFIX_MASK,
+            },
+            ip => IpAddrOrMask::from_ip(ip),
+        };
+        self.block_address(
+            address,
+            reason,
+            self.core.network.security.ban_period(reason),
+        )
+        .await
+    }
+
+    async fn block_address(
+        &self,
+        address: IpAddrOrMask,
+        reason: BlockReason,
+        ban_period: Option<u64>,
+    ) -> trc::Result<()> {
         let now = now();
-        let expires_at = self
-            .core
-            .network
-            .security
-            .ban_period(reason)
-            .map(|v| now + v);
+        let expires_at = ban_period.map(|v| now + v);
+        let expiry = expires_at.unwrap_or(u64::MAX);
         self.inner
             .data
             .blocked_ips
             .write()
-            .blocked_ip_addresses
-            .insert(IpWithTtl::new(ip, expires_at.unwrap_or(u64::MAX)));
+            .block(address.clone(), expiry);
 
         // Write blocked IP to config
-        let RegistryWriteResult::Success(id) = self
-            .registry()
-            .write(RegistryWrite::insert(
-                &BlockedIp {
-                    address: IpAddrOrMask::from_ip(ip),
-                    created_at: UTCDateTime::from_timestamp(now as i64),
-                    expires_at: expires_at.map(|ts| UTCDateTime::from_timestamp(ts as i64)),
-                    reason,
-                }
-                .into(),
-            ))
+        let object = Object::from(BlockedIp {
+            address,
+            created_at: UTCDateTime::from_timestamp(now as i64),
+            expires_at: expires_at.map(|ts| UTCDateTime::from_timestamp(ts as i64)),
+            reason,
+        });
+        let registry = self.registry();
+        let id = match registry
+            .write(RegistryWrite::insert(&object))
             .await
             .caused_by(trc::location!())?
-        else {
-            return Ok(());
+        {
+            RegistryWriteResult::Success(id) => id,
+            RegistryWriteResult::PrimaryKeyConflict { existing_id, .. } => {
+                let Some(current) = registry
+                    .get(existing_id)
+                    .await
+                    .caused_by(trc::location!())?
+                else {
+                    return Ok(());
+                };
+                let ObjectInner::BlockedIp(current_ip) = &current.inner else {
+                    return Ok(());
+                };
+                if current_ip
+                    .expires_at
+                    .as_ref()
+                    .map_or(u64::MAX, |dt| dt.timestamp() as u64)
+                    >= expiry
+                {
+                    return Ok(());
+                }
+                let RegistryWriteResult::Success(id) = registry
+                    .write(RegistryWrite::update(existing_id.id(), &object, &current))
+                    .await
+                    .caused_by(trc::location!())?
+                else {
+                    return Ok(());
+                };
+                id
+            }
+            _ => return Ok(()),
         };
 
         // Increment version
@@ -366,17 +493,7 @@ impl Server {
     }
 
     pub fn is_ip_blocked(&self, ip: IpAddr) -> bool {
-        let blocked_ips = self.inner.data.blocked_ips.read();
-        (blocked_ips
-            .blocked_ip_addresses
-            .get(&IpWithTtl::new(ip, 0))
-            .is_some_and(|v| !v.is_expired())
-            || (blocked_ips.has_blocked_networks
-                && blocked_ips
-                    .blocked_ip_networks
-                    .iter()
-                    .any(|network| network.ip.matches(&ip) && !network.is_expired())))
-            && !self.is_ip_allowed(ip)
+        self.inner.data.blocked_ips.read().is_blocked(ip) && !self.is_ip_allowed(ip)
     }
 
     pub fn is_ip_allowed(&self, ip: IpAddr) -> bool {
@@ -423,6 +540,45 @@ impl Server {
 }
 
 impl BlockedIps {
+    pub fn block(&mut self, address: IpAddrOrMask, expires_at: u64) {
+        match address {
+            IpAddrOrMask::V6 {
+                addr,
+                mask: IPV6_PREFIX_MASK,
+            } => insert_latest(
+                &mut self.blocked_ipv6_prefixes,
+                IpWithTtl::new(ipv6_prefix(addr), expires_at),
+            ),
+            address => match address.try_to_ip() {
+                Some(ip) => insert_latest(
+                    &mut self.blocked_ip_addresses,
+                    IpWithTtl::new(ip, expires_at),
+                ),
+                None => {
+                    self.blocked_ip_networks
+                        .push(IpWithTtl::new(address, expires_at));
+                    self.has_blocked_networks = true;
+                }
+            },
+        }
+    }
+
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
+        self.blocked_ip_addresses
+            .get(&IpWithTtl::new(ip, 0))
+            .is_some_and(|v| !v.is_expired())
+            || (!self.blocked_ipv6_prefixes.is_empty()
+                && matches!(ip.to_canonical(), IpAddr::V6(addr) if self
+                    .blocked_ipv6_prefixes
+                    .get(&IpWithTtl::new(ipv6_prefix(addr), 0))
+                    .is_some_and(|v| !v.is_expired())))
+            || (self.has_blocked_networks
+                && self
+                    .blocked_ip_networks
+                    .iter()
+                    .any(|network| network.ip.matches(&ip) && !network.is_expired()))
+    }
+
     pub async fn parse(bp: &mut Bootstrap) -> Self {
         let mut ips = Self::default();
 
@@ -444,13 +600,7 @@ impl BlockedIps {
                 .unwrap_or(u64::MAX);
 
             if ip.expires_at.as_ref().is_none_or(|ip| ip.timestamp() > now) {
-                if let Some(ip) = ip.address.try_to_ip() {
-                    ips.blocked_ip_addresses
-                        .insert(IpWithTtl::new(ip, expires_at));
-                } else {
-                    ips.blocked_ip_networks
-                        .push(IpWithTtl::new(ip.address, expires_at));
-                }
+                ips.block(ip.address, expires_at);
             } else {
                 expired_blocks.push((
                     id,
@@ -478,15 +628,23 @@ impl BlockedIps {
             }
             trc::event!(
                 Security(trc::SecurityEvent::IpBlockExpired),
-                Details = expired_blocks
+                Ip = expired_blocks
                     .into_iter()
                     .map(|(_, ip, _)| trc::Value::from(ip.into_inner().0))
                     .collect::<Vec<_>>()
             );
         }
 
-        ips.has_blocked_networks = !ips.blocked_ip_networks.is_empty();
         ips
+    }
+}
+
+fn insert_latest<T: PartialEq + Eq + Hash>(set: &mut AHashSet<IpWithTtl<T>>, entry: IpWithTtl<T>) {
+    if set
+        .get(&entry)
+        .is_none_or(|current| current.expires_at < entry.expires_at)
+    {
+        set.replace(entry);
     }
 }
 
@@ -513,3 +671,8 @@ impl<T: PartialEq + Eq + Hash> IpWithTtl<T> {
         self.expires_at <= now()
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/common/src/network/security/tests.rs"]
+mod tests;

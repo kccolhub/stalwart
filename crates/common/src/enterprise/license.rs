@@ -21,8 +21,10 @@
 
 use crate::manager::fetch_resource;
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
-use base64::{Engine, engine::general_purpose::STANDARD};
+use compact_str::ToCompactString;
+use encodify::base64::STANDARD;
 use hyper::{HeaderMap, header::AUTHORIZATION};
+use mail_parser::DateTime;
 use std::{
     fmt::{Display, Formatter},
     time::Duration,
@@ -199,6 +201,7 @@ impl LicenseKey {
             headers.into(),
             Duration::from_secs(60),
             1024,
+            false,
         )
         .await
         .and_then(|bytes| {
@@ -206,12 +209,22 @@ impl LicenseKey {
                 .map_err(|_| String::from("Failed to UTF-8 decode server response"))
         }) {
             Ok(encoded_key) => match LicenseKey::new(&encoded_key, &self.domain) {
-                Ok(key) => Ok(RenewedLicense { key, encoded_key }),
+                Ok(key) => {
+                    trc::event!(
+                        Server(ServerEvent::Licensing),
+                        Details = "Enterprise license renewed",
+                        Domain = key.domain.clone(),
+                        Limit = key.accounts,
+                        ValidFrom = DateTime::from_timestamp(key.valid_from as i64).to_rfc3339(),
+                        ValidTo = DateTime::from_timestamp(key.valid_to as i64).to_rfc3339(),
+                    );
+                    Ok(RenewedLicense { key, encoded_key })
+                }
                 Err(err) => {
                     trc::event!(
                         Server(ServerEvent::Licensing),
                         Details = "Failed to decode license renewal",
-                        Reason = err.to_string(),
+                        Reason = err.to_compact_string(),
                     );
                     Err(err)
                 }

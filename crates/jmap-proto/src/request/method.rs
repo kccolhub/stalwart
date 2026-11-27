@@ -6,7 +6,10 @@
 
 use crate::request::capability::Capability;
 use registry::{
-    schema::prelude::{OBJ_SINGLETON, ObjectType},
+    schema::prelude::{
+        OBJ_NO_CREATE, OBJ_NO_DESTROY, OBJ_NO_GET, OBJ_NO_QUERY, OBJ_NO_UPDATE, OBJ_SINGLETON,
+        ObjectType,
+    },
     types::EnumImpl,
 };
 use std::{borrow::Cow, fmt::Display};
@@ -40,6 +43,7 @@ pub enum MethodObject {
     FileNode,
     ParticipantIdentity,
     ShareNotification,
+    Mdn,
     Registry(ObjectType),
 }
 
@@ -63,6 +67,7 @@ impl MethodObject {
             | MethodObject::ParticipantIdentity => Capability::Calendars,
             MethodObject::AddressBook | MethodObject::ContactCard => Capability::Contacts,
             MethodObject::FileNode => Capability::FileNode,
+            MethodObject::Mdn => Capability::Mdn,
             MethodObject::Registry(_) => Capability::Stalwart,
         }
     }
@@ -83,6 +88,8 @@ pub enum MethodFunction {
     Upload,
     Echo,
     GetAvailability,
+    RegistrationOptions,
+    Send,
 }
 
 impl Display for MethodName {
@@ -100,6 +107,15 @@ impl MethodName {
         Self {
             obj: MethodObject::Thread,
             fnc: MethodFunction::Echo,
+        }
+    }
+
+    pub fn capability(&self) -> Capability {
+        match (self.obj, self.fnc) {
+            (MethodObject::Principal, MethodFunction::GetAvailability) => {
+                Capability::PrincipalsAvailability
+            }
+            (obj, _) => obj.capability(),
         }
     }
 
@@ -234,6 +250,9 @@ impl MethodName {
             }
             (MethodFunction::Set, MethodObject::ParticipantIdentity) => "ParticipantIdentity/set",
 
+            (MethodFunction::Send, MethodObject::Mdn) => "MDN/send",
+            (MethodFunction::Parse, MethodObject::Mdn) => "MDN/parse",
+
             (MethodFunction::Echo, MethodObject::Core) => "Core/echo",
             (method, MethodObject::Registry(obj)) => {
                 return Cow::Owned(format!("x:{}/{}", obj.as_str(), method.as_str()));
@@ -244,7 +263,7 @@ impl MethodName {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        hashify::tiny_map!(s.as_bytes(),
+        hashify::map!(s.as_bytes(), (MethodObject, MethodFunction),
             "PushSubscription/get" => (MethodObject::PushSubscription, MethodFunction::Get),
             "PushSubscription/set" => (MethodObject::PushSubscription, MethodFunction::Set),
 
@@ -352,18 +371,34 @@ impl MethodName {
             "ParticipantIdentity/changes" => (MethodObject::ParticipantIdentity, MethodFunction::Changes),
             "ParticipantIdentity/set" => (MethodObject::ParticipantIdentity, MethodFunction::Set),
 
+            "MDN/send" => (MethodObject::Mdn, MethodFunction::Send),
+            "MDN/parse" => (MethodObject::Mdn, MethodFunction::Parse),
+
             "Core/echo" => (MethodObject::Core, MethodFunction::Echo),
 
-        ).or_else(|| {
+        ).copied().or_else(|| {
             let (obj, fnc) = s.strip_prefix("x:")?.split_once('/')?;
             let obj = ObjectType::parse(obj)?;
-            let fnc = hashify::tiny_map!(fnc.as_bytes(),
+            let fnc = hashify::map!(fnc.as_bytes(), MethodFunction,
                 "get" => MethodFunction::Get,
                 "set" => MethodFunction::Set,
                 "query" => MethodFunction::Query,
-            )?;
+                "registrationOptions" => MethodFunction::RegistrationOptions,
+            ).copied()?;
 
-            if obj.flags() & OBJ_SINGLETON == 0 || fnc != MethodFunction::Query {
+            let flags = obj.flags();
+            let offered = match fnc {
+                MethodFunction::Get => flags & OBJ_NO_GET == 0,
+                MethodFunction::Query => flags & (OBJ_SINGLETON | OBJ_NO_QUERY) == 0,
+                MethodFunction::Set => {
+                    flags & (OBJ_NO_CREATE | OBJ_NO_UPDATE | OBJ_NO_DESTROY)
+                        != (OBJ_NO_CREATE | OBJ_NO_UPDATE | OBJ_NO_DESTROY)
+                }
+                MethodFunction::RegistrationOptions => obj == ObjectType::Passkey,
+                _ => true,
+            };
+
+            if offered {
                 (MethodObject::Registry(obj), fnc).into()
             } else {
                 None
@@ -396,6 +431,7 @@ impl Display for MethodObject {
             MethodObject::CalendarEvent => "CalendarEvent",
             MethodObject::CalendarEventNotification => "CalendarEventNotification",
             MethodObject::ShareNotification => "ShareNotification",
+            MethodObject::Mdn => "MDN",
             MethodObject::Registry(obj) => {
                 f.write_str("x:")?;
                 return f.write_str(obj.as_str());
@@ -420,6 +456,8 @@ impl MethodFunction {
             MethodFunction::Upload => "upload",
             MethodFunction::Echo => "echo",
             MethodFunction::GetAvailability => "getAvailability",
+            MethodFunction::RegistrationOptions => "registrationOptions",
+            MethodFunction::Send => "send",
         }
     }
 }

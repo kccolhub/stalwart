@@ -5,12 +5,27 @@
  */
 
 use crate::{RegistryStore, RegistryStoreInner, Store};
-use registry::schema::structs::DataStore;
-use std::{net::IpAddr, path::PathBuf};
+use registry::schema::structs::{DataStore, FoundationDbCluster, FoundationDbClusterFile};
+use serde::{Deserialize, de::IgnoredAny};
+use std::{io, net::IpAddr, path::PathBuf};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use utils::snowflake::SnowflakeIdGenerator;
 
+#[cfg(unix)]
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+#[cfg(unix)]
+const DATA_STORE_FILE_MODE: u32 = 0o600;
+
+#[derive(Deserialize)]
+struct LegacyFoundationDbStore {
+    #[serde(rename = "clusterFile")]
+    cluster_file: Option<String>,
+    cluster: Option<IgnoredAny>,
+}
+
 pub(crate) enum RegistryInit {
-    Ok(DataStore),
+    Ok(Box<DataStore>),
     Err(String),
     Bootstrap,
 }
@@ -34,8 +49,13 @@ impl RegistryStoreInner {
             local_path,
             store: Store::None,
             id_generator: SnowflakeIdGenerator::new(),
+            process_nonce: rand::random(),
             node_id: 0,
             env_recovery_mode: std::env::var("STALWART_RECOVERY_MODE")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            env_update_role_permissions: std::env::var("STALWART_UPDATE_ROLE_PERMISSIONS")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -70,8 +90,8 @@ impl RegistryStoreInner {
 
     pub(crate) async fn read_data_store(&self) -> RegistryInit {
         match tokio::fs::read_to_string(&self.local_path).await {
-            Ok(contents) => match serde_json::from_str::<DataStore>(&contents) {
-                Ok(data_store) => RegistryInit::Ok(data_store),
+            Ok(contents) => match parse_data_store(&contents) {
+                Ok(data_store) => RegistryInit::Ok(Box::new(data_store)),
                 Err(err) => RegistryInit::Err(format!(
                     "Failed to parse data store settings at {}: {}",
                     self.local_path.display(),
@@ -88,6 +108,21 @@ impl RegistryStoreInner {
     }
 }
 
+fn parse_data_store(contents: &str) -> Result<DataStore, String> {
+    let mut data_store =
+        serde_json::from_str::<DataStore>(contents).map_err(|err| err.to_string())?;
+    if let DataStore::FoundationDb(store) = &mut data_store
+        && let Ok(LegacyFoundationDbStore {
+            cluster_file: Some(path),
+            cluster: None,
+        }) = serde_json::from_str(contents)
+        && !path.trim().is_empty()
+    {
+        store.cluster = FoundationDbCluster::File(FoundationDbClusterFile { path: Some(path) });
+    }
+    Ok(data_store)
+}
+
 impl RegistryStore {
     pub async fn write_data_store(&self, data_store: &DataStore) -> trc::Result<()> {
         let json_text = serde_json::to_string(data_store).map_err(|err| {
@@ -96,13 +131,32 @@ impl RegistryStore {
                 .caused_by(trc::location!())
                 .reason(err)
         })?;
-        tokio::fs::write(&self.0.local_path, json_text)
+        let write_error = |err: io::Error| {
+            trc::EventType::Registry(trc::RegistryEvent::LocalWriteError)
+                .into_err()
+                .caused_by(trc::location!())
+                .reason(err)
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(DATA_STORE_FILE_MODE);
+        let mut file = options
+            .open(&self.0.local_path)
             .await
-            .map_err(|err| {
-                trc::EventType::Registry(trc::RegistryEvent::LocalWriteError)
-                    .into_err()
-                    .caused_by(trc::location!())
-                    .reason(err)
-            })
+            .map_err(write_error)?;
+        #[cfg(unix)]
+        let _ = file
+            .set_permissions(Permissions::from_mode(DATA_STORE_FILE_MODE))
+            .await;
+        file.write_all(json_text.as_bytes())
+            .await
+            .map_err(write_error)?;
+        file.flush().await.map_err(write_error)
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/store/src/registry/local/tests.rs"]
+mod tests;

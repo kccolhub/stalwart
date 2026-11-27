@@ -44,6 +44,23 @@ pub struct Hit {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BulkResponse {
+    pub errors: bool,
+    #[serde(default)]
+    pub items: Vec<BulkItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkItem {
+    pub index: Option<BulkItemResult>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkItemResult {
+    pub error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DeleteByQueryResponse {
     pub deleted: u64,
 }
@@ -51,26 +68,15 @@ pub struct DeleteByQueryResponse {
 impl SearchField {
     pub fn es_schema(&self) -> Value {
         match self {
-            SearchField::AccountId
-            | SearchField::DocumentId
-            | SearchField::Email(EmailSearchField::Size) => json!({
+            SearchField::AccountId | SearchField::DocumentId => json!({
               "type": "integer"
             }),
             SearchField::Id
-            | SearchField::Email(EmailSearchField::SentAt | EmailSearchField::ReceivedAt)
-            | SearchField::Calendar(CalendarSearchField::Start)
             | SearchField::Tracing(TracingSearchField::QueueId | TracingSearchField::EventType) => {
                 json!({
                   "type": "long"
                 })
             }
-            SearchField::Email(EmailSearchField::HasAttachment) => json!({
-              "type": "boolean"
-            }),
-            SearchField::Calendar(CalendarSearchField::Uid)
-            | SearchField::Contact(ContactSearchField::Uid) => json!({
-              "type": "keyword",
-            }),
             SearchField::Email(
                 EmailSearchField::From | EmailSearchField::To | EmailSearchField::Subject,
             ) => json!({
@@ -87,7 +93,7 @@ impl SearchField {
                   "enabled": true
                 })
             }
-            #[cfg(feature = "test_mode")]
+            #[cfg(stalwart_tests)]
             SearchField::Email(EmailSearchField::Bcc | EmailSearchField::Cc) => {
                 json!({
                   "type": "text",
@@ -98,7 +104,7 @@ impl SearchField {
                   }
                 })
             }
-            #[cfg(not(feature = "test_mode"))]
+            #[cfg(not(stalwart_tests))]
             SearchField::Email(EmailSearchField::Bcc | EmailSearchField::Cc) => {
                 json!({
                   "type": "text"
@@ -124,7 +130,7 @@ impl SearchField {
                 | ContactSearchField::Address
                 | ContactSearchField::Note,
             )
-            | SearchField::File(FileSearchField::Name | FileSearchField::Content)
+            | SearchField::File(FileSearchField::Content)
             | SearchField::Tracing(TracingSearchField::Keywords) => json!({
               "type": "text"
             }),

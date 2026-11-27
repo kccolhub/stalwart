@@ -5,20 +5,25 @@
  */
 
 use super::stream::WebSocketHandler;
-use common::{Server, auth::AccessToken};
+use common::{Server, auth::AccessToken, cache::http_auth::RevocationEpoch};
+use compact_str::ToCompactString;
 use http_proto::*;
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use tokio_tungstenite::WebSocketStream;
 use trc::JmapEvent;
-use tungstenite::{handshake::derive_accept_key, protocol::Role};
+use tungstenite::{
+    handshake::derive_accept_key,
+    protocol::{Role, WebSocketConfig},
+};
 
 pub trait WebSocketUpgrade: Sync + Send {
     fn upgrade_websocket_connection(
         &self,
         req: HttpRequest,
         access_token: AccessToken,
+        epoch: RevocationEpoch,
         session: HttpSessionData,
     ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
 }
@@ -28,6 +33,7 @@ impl WebSocketUpgrade for Server {
         &self,
         req: HttpRequest,
         access_token: AccessToken,
+        epoch: RevocationEpoch,
         session: HttpSessionData,
     ) -> trc::Result<HttpResponse> {
         let headers = req.headers();
@@ -74,22 +80,26 @@ impl WebSocketUpgrade for Server {
 
         // Spawn WebSocket connection
         let jmap = self.clone();
+        let max_size = self.core.jmap.request_max_size;
         tokio::spawn(async move {
             // Upgrade connection
             let session_id = session.session_id;
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
-                    Box::pin(
-                        jmap.handle_websocket_stream(
-                            WebSocketStream::from_raw_socket(
-                                TokioIo::new(upgraded),
-                                Role::Server,
-                                None,
-                            )
-                            .await,
-                            access_token,
-                            session,
-                        ),
+                    jmap.handle_websocket_stream(
+                        WebSocketStream::from_raw_socket(
+                            TokioIo::new(upgraded),
+                            Role::Server,
+                            Some(
+                                WebSocketConfig::default()
+                                    .max_message_size(Some(max_size))
+                                    .max_frame_size(Some(max_size)),
+                            ),
+                        )
+                        .await,
+                        access_token,
+                        epoch,
+                        session,
                     )
                     .await;
                 }
@@ -98,7 +108,7 @@ impl WebSocketUpgrade for Server {
                         Jmap(JmapEvent::WebsocketError),
                         Details = "Websocket upgrade failed",
                         SpanId = session_id,
-                        Reason = err.to_string()
+                        Reason = err.to_compact_string()
                     );
                 }
             }

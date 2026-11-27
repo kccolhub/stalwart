@@ -10,7 +10,7 @@ use common::{
     BuildServer,
     network::{SessionData, SessionManager, SessionResult, SessionStream},
 };
-use imap_proto::receiver::{self, Receiver};
+use imap_proto::receiver::{self, MAX_UNAUTHENTICATED_REQUEST_SIZE, Receiver};
 use tokio_rustls::server::TlsStream;
 
 impl SessionManager for ManageSieveSessionManager {
@@ -23,11 +23,14 @@ impl SessionManager for ManageSieveSessionManager {
             // Create session
             let server = self.inner.build_server();
             let mut session = Session {
-                receiver: Receiver::with_max_request_size(server.core.imap.max_request_size)
+                receiver: Receiver::with_max_request_size(MAX_UNAUTHENTICATED_REQUEST_SIZE)
                     .with_start_state(receiver::State::Command { is_uid: false }),
                 server,
                 instance: session.instance,
-                state: State::NotAuthenticated { auth_failures: 0 },
+                state: State::NotAuthenticated {
+                    auth_failures: 0,
+                    sasl_failure: None,
+                },
                 session_id: session.session_id,
                 stream: session.stream,
                 in_flight: session.in_flight,
@@ -64,11 +67,7 @@ impl<T: SessionStream> Session<T> {
         loop {
             tokio::select! {
                 result = tokio::time::timeout(
-                    if !matches!(self.state, State::NotAuthenticated {..}) {
-                        self.server.core.imap.timeout_auth
-                    } else {
-                        self.server.core.imap.timeout_unauth
-                    },
+                    self.timeout(),
                     self.read(&mut buf)) => {
                         match result {
                             Ok(Ok(bytes_read)) => {
@@ -130,8 +129,9 @@ impl<T: SessionStream> Session<T> {
         false
     }
 
-    pub async fn into_tls(self) -> Result<Session<TlsStream<T>>, ()> {
-        let receiver = Receiver::with_max_request_size(self.server.core.imap.max_request_size)
+    pub async fn into_tls(mut self) -> Result<Session<TlsStream<T>>, ()> {
+        self.state.take_sasl_failure();
+        let receiver = Receiver::with_max_request_size(self.receiver.max_request_size)
             .with_start_state(receiver::State::Command { is_uid: false });
 
         Ok(Session {

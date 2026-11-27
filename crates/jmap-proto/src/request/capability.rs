@@ -4,16 +4,24 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::fmt;
+use compact_str::CompactString;
+use std::{borrow::Cow, fmt};
 
 use crate::{
-    object::{email::EmailComparator, file_node::FileNodeComparator},
+    object::{
+        email::EmailComparator,
+        file_node::{FileNodeComparator, FileNodeNodeType},
+    },
     response::serialize::serialize_hex,
     types::date::UTCDate,
 };
 use ahash::AHashMap;
 use serde::{Deserialize, Deserializer};
-use types::{id::Id, type_state::DataType};
+use types::{
+    id::Id,
+    metadata::{NamespaceScope, RegisteredNamespace},
+    type_state::DataType,
+};
 use utils::map::vec_map::VecMap;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -95,6 +103,10 @@ pub enum Capability {
     WebPushVapid = 1 << 18,
     #[serde(rename(serialize = "urn:ietf:params:jmap:emailpush"))]
     EmailPush = 1 << 19,
+    #[serde(rename(serialize = "urn:ietf:params:jmap:metadata"))]
+    Metadata = 1 << 20,
+    #[serde(rename(serialize = "urn:ietf:params:jmap:mdn"))]
+    Mdn = 1 << 21,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,6 +116,15 @@ pub struct CapabilityIds(pub u32);
 impl CapabilityIds {
     pub fn contains(&self, capability: Capability) -> bool {
         self.0 & capability as u32 != 0
+    }
+}
+
+impl FromIterator<Capability> for CapabilityIds {
+    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
+        CapabilityIds(
+            iter.into_iter()
+                .fold(0, |ids, capability| ids | capability as u32),
+        )
     }
 }
 
@@ -120,10 +141,12 @@ pub enum Capabilities {
     Blob(BlobCapabilities),
     Contacts(ContactsCapabilities),
     Principals(PrincipalCapabilities),
+    PrincipalsOwner(PrincipalOwnerCapabilities),
     PrincipalsAvailability(PrincipalAvailabilityCapabilities),
     Calendar(CalendarCapabilities),
     FileNode(FileNodeCapabilities),
     WebPush(WebPushCapabilities),
+    Metadata(MetadataCapabilities),
     Empty(EmptyCapabilities),
 }
 
@@ -251,26 +274,13 @@ pub struct PrincipalCapabilities {
     pub current_user_principal_id: Option<Id>,
 }
 
-/*#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PrincipalOwnerCapabilities {
     #[serde(rename(serialize = "accountIdForPrincipal"))]
     pub account_id_for_principal: Id,
-
     #[serde(rename(serialize = "principalId"))]
     pub principal_id: Id,
 }
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PrincipalCalendarCapabilities {
-    #[serde(rename(serialize = "accountIdForPrincipal"))]
-    pub account_id_for_principal: Option<Id>,
-    #[serde(rename(serialize = "mayGetAvailability"))]
-    pub may_get_availability: bool,
-    #[serde(rename(serialize = "mayShareWith"))]
-    pub may_share_with: bool,
-    #[serde(rename(serialize = "calendarAddress"))]
-    pub calendar_address: String,
-}*/
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileNodeCapabilities {
@@ -284,6 +294,8 @@ pub struct FileNodeCapabilities {
     pub forbidden_node_names: Option<Vec<String>>,
     #[serde(rename(serialize = "fileNodeQuerySortOptions"))]
     pub file_node_query_sort_options: Vec<FileNodeComparator>,
+    #[serde(rename(serialize = "supportedNodeTypes"))]
+    pub supported_node_types: &'static [FileNodeNodeType],
     #[serde(rename(serialize = "mayCreateTopLevelFileNode"))]
     pub may_create_top_level_file_node: bool,
     #[serde(rename(serialize = "caseInsensitiveNames"))]
@@ -300,6 +312,24 @@ pub struct FileNodeCapabilities {
 pub struct WebPushCapabilities {
     #[serde(rename(serialize = "applicationServerKey"))]
     pub application_server_key: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MetadataCapabilities {
+    #[serde(rename(serialize = "dataTypes"))]
+    pub data_types: VecMap<DataType, DataTypeMetadataInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DataTypeMetadataInfo {
+    #[serde(rename(serialize = "namespaces"))]
+    pub namespaces: Vec<&'static str>,
+    #[serde(rename(serialize = "supportsVendorNamespaces"))]
+    pub supports_vendor_namespaces: bool,
+    #[serde(rename(serialize = "supportsPrivate"))]
+    pub supports_private: bool,
+    #[serde(rename(serialize = "maxDepth"))]
+    pub max_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -334,6 +364,19 @@ impl Capability {
             Capability::Stalwart => "urn:stalwart:jmap",
             Capability::WebPushVapid => "urn:ietf:params:jmap:webpush-vapid",
             Capability::EmailPush => "urn:ietf:params:jmap:emailpush",
+            Capability::Metadata => "urn:ietf:params:jmap:metadata",
+            Capability::Mdn => "urn:ietf:params:jmap:mdn",
+        }
+    }
+
+    pub fn for_data_type(data_type: DataType) -> Option<Self> {
+        match data_type {
+            DataType::Email | DataType::Mailbox => Some(Capability::Mail),
+            DataType::SieveScript => Some(Capability::Sieve),
+            DataType::Calendar | DataType::CalendarEvent => Some(Capability::Calendars),
+            DataType::AddressBook | DataType::ContactCard => Some(Capability::Contacts),
+            DataType::FileNode => Some(Capability::FileNode),
+            _ => None,
         }
     }
 
@@ -358,6 +401,8 @@ impl Capability {
             Capability::Stalwart,
             Capability::WebPushVapid,
             Capability::EmailPush,
+            Capability::Metadata,
+            Capability::Mdn,
         ]
     }
 }
@@ -457,9 +502,59 @@ impl Capabilities {
     }
 }
 
+impl MetadataCapabilities {
+    pub fn to_account_capabilities(
+        &self,
+        account_capabilities: CapabilityIds,
+        supports_private: bool,
+    ) -> Option<MetadataCapabilities> {
+        let data_types = self
+            .data_types
+            .iter()
+            .filter(|(data_type, _)| {
+                Capability::for_data_type(**data_type)
+                    .is_some_and(|capability| account_capabilities.contains(capability))
+            })
+            .filter_map(|(data_type, info)| {
+                info.to_account_info(supports_private)
+                    .map(|info| (*data_type, info))
+            })
+            .collect::<VecMap<_, _>>();
+
+        (!data_types.is_empty()).then_some(MetadataCapabilities { data_types })
+    }
+}
+
+impl DataTypeMetadataInfo {
+    fn to_account_info(&self, supports_private: bool) -> Option<DataTypeMetadataInfo> {
+        let supports_private = self.supports_private && supports_private;
+        let namespaces = if supports_private {
+            self.namespaces.clone()
+        } else {
+            self.namespaces
+                .iter()
+                .copied()
+                .filter(|name| {
+                    RegisteredNamespace::by_name(name)
+                        .is_none_or(|namespace| namespace.scope != NamespaceScope::PrivateMetadata)
+                })
+                .collect()
+        };
+
+        (self.supports_vendor_namespaces || !namespaces.is_empty()).then_some(
+            DataTypeMetadataInfo {
+                namespaces,
+                supports_vendor_namespaces: self.supports_vendor_namespaces,
+                supports_private,
+                max_depth: self.max_depth,
+            },
+        )
+    }
+}
+
 impl Capability {
     pub fn parse(s: &str) -> Option<Self> {
-        hashify::tiny_map!(s.as_bytes(),
+        hashify::map!(s.as_bytes(), Capability,
             "urn:ietf:params:jmap:core" => Capability::Core,
             "urn:ietf:params:jmap:mail" => Capability::Mail,
             "urn:ietf:params:jmap:submission" => Capability::Submission,
@@ -480,19 +575,28 @@ impl Capability {
             "urn:stalwart:jmap" => Capability::Stalwart,
             "urn:ietf:params:jmap:webpush-vapid" => Capability::WebPushVapid,
             "urn:ietf:params:jmap:emailpush" => Capability::EmailPush,
+            "urn:ietf:params:jmap:metadata" => Capability::Metadata,
+            "urn:ietf:params:jmap:mdn" => Capability::Mdn,
         )
+        .copied()
     }
 }
 
-impl<'de> Deserialize<'de> for CapabilityIds {
+#[derive(Debug, Default)]
+pub(crate) struct RequestedCapabilities {
+    pub ids: CapabilityIds,
+    pub unknown: Option<CompactString>,
+}
+
+impl<'de> Deserialize<'de> for RequestedCapabilities {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct CapabilityIdsVisitor;
+        struct RequestedCapabilitiesVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for CapabilityIdsVisitor {
-            type Value = CapabilityIds;
+        impl<'de> serde::de::Visitor<'de> for RequestedCapabilitiesVisitor {
+            type Value = RequestedCapabilities;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("an array of capability strings")
@@ -502,23 +606,28 @@ impl<'de> Deserialize<'de> for CapabilityIds {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let mut capability_flags = 0u32;
+                let mut requested = RequestedCapabilities::default();
 
-                while let Some(capability_str) = seq.next_element::<std::borrow::Cow<str>>()? {
-                    let capability =
-                        Capability::parse(capability_str.as_ref()).ok_or_else(|| {
-                            serde::de::Error::custom(format!(
-                                "Unknown capability: {capability_str:?}"
-                            ))
-                        })?;
-
-                    capability_flags |= capability as u32;
+                while let Some(capability_str) = seq.next_element::<Cow<str>>()? {
+                    match Capability::parse(capability_str.as_ref()) {
+                        Some(capability) => requested.ids.0 |= capability as u32,
+                        None => {
+                            requested
+                                .unknown
+                                .get_or_insert_with(|| CompactString::from(capability_str));
+                        }
+                    }
                 }
 
-                Ok(CapabilityIds(capability_flags))
+                Ok(requested)
             }
         }
 
-        deserializer.deserialize_seq(CapabilityIdsVisitor)
+        deserializer.deserialize_seq(RequestedCapabilitiesVisitor)
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/jmap-proto/src/request/capability/tests.rs"]
+mod tests;

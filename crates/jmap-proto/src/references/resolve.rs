@@ -10,6 +10,7 @@ use crate::{
         copy::CopyRequest,
         get::GetRequest,
         import::ImportEmailRequest,
+        mdn::{MdnParseRequest, MdnSendRequest},
         parse::ParseRequest,
         search_snippet::GetSearchSnippetRequest,
         set::{SetRequest, SetResponse},
@@ -24,10 +25,13 @@ use crate::{
     },
     response::Response,
 };
+use ahash::AHashMap;
 use compact_str::format_compact;
 use jmap_tools::{Element, Key, Property, Value};
-use std::collections::HashMap;
 use types::id::Id;
+
+const EMBEDDED_BLOB_REFERENCE_DEPTH: usize = 8;
+const EMAIL_BODY_REFERENCE_DEPTH: usize = 128;
 
 impl Response<'_> {
     pub fn resolve_references(&self, request: &mut RequestMethod) -> trc::Result<()> {
@@ -60,7 +64,9 @@ impl Response<'_> {
                 GetRequestMethod::Registry(request) => request.resolve_references(self)?,
             },
             RequestMethod::Set(request) => match request {
-                SetRequestMethod::Email(request) => request.resolve_references(self, 2, false)?,
+                SetRequestMethod::Email(request) => {
+                    request.resolve_references(self, EMAIL_BODY_REFERENCE_DEPTH, false)?
+                }
                 SetRequestMethod::Mailbox(request) => request.resolve_references(self, 1, false)?,
                 SetRequestMethod::Identity(request) => {
                     request.resolve_references(self, 1, false)?
@@ -79,7 +85,7 @@ impl Response<'_> {
                     request.resolve_references(self, 1, false)?
                 }
                 SetRequestMethod::ContactCard(request) => {
-                    request.resolve_references(self, 1, false)?
+                    request.resolve_references(self, EMBEDDED_BLOB_REFERENCE_DEPTH, false)?
                 }
                 SetRequestMethod::FileNode(request) => {
                     request.resolve_references(self, 1, false)?
@@ -91,7 +97,7 @@ impl Response<'_> {
                     request.resolve_references(self, 1, false)?
                 }
                 SetRequestMethod::CalendarEvent(request) => {
-                    request.resolve_references(self, 1, false)?
+                    request.resolve_references(self, EMBEDDED_BLOB_REFERENCE_DEPTH, false)?
                 }
                 SetRequestMethod::CalendarEventNotification(request) => {
                     request.resolve_references(self, 1, false)?
@@ -102,19 +108,21 @@ impl Response<'_> {
                 SetRequestMethod::Registry(request) => request.resolve_references(self, 5, true)?,
             },
             RequestMethod::Copy(request) => match request {
-                CopyRequestMethod::Email(request) => request.resolve_references(self, 1, false)?,
+                CopyRequestMethod::Email(request) => request.resolve_references(self, 2, false)?,
                 CopyRequestMethod::CalendarEvent(request) => {
-                    request.resolve_references(self, 1, false)?
+                    request.resolve_references(self, EMBEDDED_BLOB_REFERENCE_DEPTH, false)?
                 }
                 CopyRequestMethod::ContactCard(request) => {
-                    request.resolve_references(self, 1, false)?
+                    request.resolve_references(self, EMBEDDED_BLOB_REFERENCE_DEPTH, false)?
                 }
                 CopyRequestMethod::FileNode(request) => {
-                    request.resolve_references(self, 1, false)?
+                    request.resolve_references(self, 2, false)?
                 }
                 CopyRequestMethod::Blob(_) => (),
             },
             RequestMethod::ImportEmail(request) => request.resolve_references(self)?,
+            RequestMethod::MdnSend(request) => request.resolve_references(self)?,
+            RequestMethod::MdnParse(request) => request.resolve_references(self)?,
             RequestMethod::SearchSnippet(request) => request.resolve_references(self)?,
             RequestMethod::UploadBlob(request) => request.resolve_references(self)?,
             RequestMethod::Parse(request) => match request {
@@ -259,7 +267,7 @@ impl<'x, T: JmapObject> ResolveSetReference for SetRequest<'x, T> {
     ) -> trc::Result<()> {
         // Resolve create references
         if let Some(create) = &mut self.create {
-            let mut graph = HashMap::with_capacity(create.len());
+            let mut graph = AHashMap::new();
             for (id, obj) in create.iter_mut() {
                 obj.eval_object_references(
                     response,
@@ -309,12 +317,8 @@ impl<'x, T: JmapObject> ResolveSetReference for CopyRequest<'x, T> {
         eval_strings: bool,
     ) -> trc::Result<()> {
         // Resolve create references
-        for (id, obj) in self.create.iter_mut() {
+        for obj in self.create.values_mut() {
             obj.eval_object_references(response, &mut Graph::None, 0, max_depth, eval_strings)?;
-
-            if let MaybeIdReference::Reference(ir) = id {
-                *id = MaybeIdReference::Id(response.eval_id_reference(ir)?);
-            }
         }
 
         Ok(())
@@ -324,6 +328,32 @@ impl<'x, T: JmapObject> ResolveSetReference for CopyRequest<'x, T> {
 impl<T: JmapObject> ResolveReference for ParseRequest<T> {
     fn resolve_references(&mut self, response: &Response<'_>) -> trc::Result<()> {
         // Resolve blobId references
+        for id in self.blob_ids.iter_mut() {
+            if let MaybeIdReference::Reference(ir) = id {
+                *id = MaybeIdReference::Id(response.eval_blob_id_reference(ir)?);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ResolveReference for MdnSendRequest<'_> {
+    fn resolve_references(&mut self, response: &Response<'_>) -> trc::Result<()> {
+        for mdn in self.send.values_mut() {
+            if let Some(id) = &mut mdn.for_email_id
+                && let MaybeIdReference::Reference(ir) = id
+            {
+                *id = MaybeIdReference::Id(response.eval_id_reference(ir)?);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ResolveReference for MdnParseRequest {
+    fn resolve_references(&mut self, response: &Response<'_>) -> trc::Result<()> {
         for id in self.blob_ids.iter_mut() {
             if let MaybeIdReference::Reference(ir) = id {
                 *id = MaybeIdReference::Id(response.eval_blob_id_reference(ir)?);
@@ -385,7 +415,7 @@ impl ResolveReference for GetSearchSnippetRequest {
 
 impl ResolveReference for BlobUploadRequest {
     fn resolve_references(&mut self, response: &Response<'_>) -> trc::Result<()> {
-        let mut graph = HashMap::with_capacity(self.create.len());
+        let mut graph = AHashMap::<String, Vec<String>>::new();
         for (create_id, object) in self.create.iter_mut() {
             for data in &mut object.data {
                 if let DataSourceObject::Id { id, .. } = data
@@ -403,10 +433,13 @@ impl ResolveReference for BlobUploadRequest {
                             ));
                         }
                         None => {
-                            graph
-                                .entry(create_id.to_string())
-                                .or_insert_with(Vec::new)
-                                .push(parent_id.to_string());
+                            let parent_id = parent_id.to_string();
+                            match graph.get_mut(create_id.as_str()) {
+                                Some(parents) => parents.push(parent_id),
+                                None => {
+                                    graph.insert(create_id.to_string(), vec![parent_id]);
+                                }
+                            }
                         }
                     }
                 }

@@ -11,8 +11,10 @@ use crate::{
         query::RegistryQueryFilters,
     },
 };
-use chrono::DateTime;
+use common::config::telemetry::LogFiles;
+use jiff::Timestamp;
 use jmap_proto::types::state::State;
+use memchr::{memmem, memrchr};
 use registry::{
     jmap::IntoValue,
     schema::{enums::TracingLevel, prelude::Property, structs::Log},
@@ -20,9 +22,9 @@ use registry::{
 };
 use std::{
     borrow::Cow,
-    fs::{self, File},
+    fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    mem,
 };
 use store::ahash::AHashMap;
 use tokio::sync::oneshot;
@@ -32,7 +34,7 @@ use types::id::Id;
 pub(crate) async fn log_get(
     mut get: RegistryGetResponse<'_>,
 ) -> trc::Result<RegistryGetResponse<'_>> {
-    let Some(path) = get.server.core.metrics.log_path.clone() else {
+    let Some(files) = get.server.core.metrics.log_files.clone() else {
         return Err(trc::JmapEvent::InvalidArguments
             .into_err()
             .details("No log tracers configured on the server"));
@@ -45,7 +47,7 @@ pub(crate) async fn log_get(
         let limit = get.server.core.jmap.get_max_objects;
         let (tx, rx) = oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send(read_log_entries(path, ids, limit));
+            let _ = tx.send(read_log_entries(&files, ids, limit));
         });
 
         rx.await
@@ -72,7 +74,7 @@ pub(crate) async fn log_get(
 pub(crate) async fn log_query(
     mut req: RegistryQueryResponse<'_>,
 ) -> trc::Result<QueryResponseBuilder> {
-    let Some(path) = req.server.core.metrics.log_path.clone() else {
+    let Some(files) = req.server.core.metrics.log_files.clone() else {
         return Err(trc::JmapEvent::InvalidArguments
             .into_err()
             .details("No log tracers configured on the server"));
@@ -118,7 +120,7 @@ pub(crate) async fn log_query(
     let (tx, rx) = oneshot::channel();
 
     tokio::task::spawn_blocking(move || {
-        let _ = tx.send(read_log_offsets(path, filter.as_deref(), anchor, limit));
+        let _ = tx.send(read_log_offsets(&files, filter.as_deref(), anchor, limit));
     });
 
     // Build response
@@ -148,44 +150,46 @@ pub(crate) async fn log_query(
 }
 
 fn read_log_offsets(
-    path: impl AsRef<Path>,
+    files: &LogFiles,
     filter: Option<&str>,
     anchor: u64,
     limit: usize,
 ) -> io::Result<Vec<Id>> {
-    let mut logs = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    logs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
+    let logs = files.newest_first()?;
     let mut entries = Vec::with_capacity(limit);
+    let finder = filter.map(memmem::Finder::new);
     let mut file_number = 0u64;
     let mut found_anchor = anchor == 0;
     let file_anchor = anchor >> 48;
 
-    'outer: for log in logs.into_iter() {
-        if !log.file_type()?.is_file() {
-            continue;
-        }
-
+    'outer: for log in logs {
         if !found_anchor && file_anchor != file_number {
             file_number += 1;
             continue;
         }
 
-        let file = File::open(log.path())?;
+        let file = File::open(log)?;
         let file_size = file.metadata()?.len();
-        let mut rev_lines = RevLines::new(file);
-        rev_lines.0.init_reader()?;
+        let mut rev_lines = RawRevLines::new(file);
+        rev_lines.init_reader()?;
 
         let mut offset = file_size;
+        let mut continuation_matches = false;
 
         for line in rev_lines {
             let line = line?;
             offset = offset.saturating_sub(line.len() as u64 + 1); // +1 for the newline character
 
+            let line_matches = finder
+                .as_ref()
+                .is_some_and(|finder| finder.find(&line).is_some());
+
             if !is_log_header(&line) {
+                continuation_matches |= line_matches;
                 continue;
             }
 
+            let matches = finder.is_none() || mem::take(&mut continuation_matches) || line_matches;
             let id = (file_number << 48) | offset;
 
             if !found_anchor {
@@ -193,7 +197,7 @@ fn read_log_offsets(
                 continue;
             }
 
-            if filter.is_none_or(|filter| line.contains(filter)) {
+            if matches {
                 entries.push(Id::from(id));
                 if entries.len() == limit {
                     break 'outer;
@@ -208,22 +212,18 @@ fn read_log_offsets(
 }
 
 fn read_log_entries(
-    path: impl AsRef<Path>,
+    files: &LogFiles,
     ids: Option<Vec<Id>>,
     limit: usize,
 ) -> io::Result<Vec<(Id, Log)>> {
-    let path = path.as_ref();
     let ids = if let Some(mut ids) = ids {
         ids.truncate(limit);
         ids
     } else {
-        read_log_offsets(path, None, 0, limit)?
+        read_log_offsets(files, None, 0, limit)?
     };
 
-    let mut logs = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-
-    // Sort the entries by file name in reverse order.
-    logs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+    let logs = files.newest_first()?;
 
     let mut entries = Vec::with_capacity(ids.len());
 
@@ -239,16 +239,12 @@ fn read_log_entries(
             .push(offset);
     }
 
-    let mut file_number = 0u64;
     let mut line = String::with_capacity(256);
+    let mut continuation = Vec::with_capacity(256);
 
-    'outer: for log in logs.into_iter() {
-        if !log.file_type()?.is_file() {
-            continue;
-        }
-
+    'outer: for (file_number, log) in (0u64..).zip(logs) {
         if let Some(offsets) = offset_map.get(&file_number) {
-            let mut reader = BufReader::new(File::open(log.path())?);
+            let mut reader = BufReader::new(File::open(log)?);
 
             for offset in offsets {
                 // seek to the offset and read the line
@@ -256,7 +252,20 @@ fn read_log_entries(
                 line.clear();
                 reader.read_line(&mut line)?;
 
-                if let Some(log) = log_from_line(&line) {
+                if let Some(mut log) = log_from_line(&line) {
+                    while reader.fill_buf()?.first() == Some(&b'\t') {
+                        continuation.clear();
+                        reader.read_until(b'\n', &mut continuation)?;
+                        let key = String::from_utf8_lossy(&continuation);
+                        let key = strip_ansi(&key);
+                        let key = key.trim();
+                        if !key.is_empty() {
+                            if !log.details.is_empty() {
+                                log.details.push_str(", ");
+                            }
+                            log.details.push_str(key);
+                        }
+                    }
                     entries.push((Id::from((file_number << 48) | *offset), log));
 
                     if entries.len() == total_ids {
@@ -265,35 +274,40 @@ fn read_log_entries(
                 }
             }
         }
-
-        file_number += 1;
     }
 
     Ok(entries)
 }
 
-fn is_log_header(line: &str) -> bool {
-    let line = strip_ansi(line);
-    let bytes = line.as_bytes();
-    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+const ESC_BYTE: u8 = 0x1b;
+
+fn is_log_header(line: &[u8]) -> bool {
+    if !line
+        .first()
+        .is_some_and(|byte| byte.is_ascii_digit() || *byte == ESC_BYTE)
+    {
         return false;
     }
-    let Some((timestamp, _)) = line.split_once(' ') else {
+    let Ok(line) = std::str::from_utf8(line) else {
         return false;
     };
-    DateTime::parse_from_rfc3339(timestamp).is_ok()
+    let line = strip_ansi(line);
+    line.split_once(' ').is_some_and(|(timestamp, _)| {
+        timestamp.starts_with(|c: char| c.is_ascii_digit())
+            && timestamp.parse::<Timestamp>().is_ok()
+    })
 }
 
 fn log_from_line(line: &str) -> Option<Log> {
     let line = strip_ansi(line);
     let (timestamp, rest) = line.split_once(' ')?;
-    let timestamp = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let timestamp = timestamp.parse::<Timestamp>().ok()?;
     let (level, rest) = rest.trim().split_once(' ')?;
     let (_, rest) = rest.trim().split_once(" (")?;
     let (event_id, details) = rest.split_once(")")?;
 
     Some(Log {
-        timestamp: UTCDateTime::from_timestamp(timestamp.timestamp()),
+        timestamp: UTCDateTime::from_timestamp(timestamp.as_second()),
         level: TracingLevel::parse(&level.to_ascii_lowercase()).unwrap_or(TracingLevel::Info),
         event: EventType::parse(event_id)?,
         details: details.trim().to_string(),
@@ -451,21 +465,26 @@ impl<R: Seek + Read> RawRevLines<R> {
                 }
             }
 
-            let buffer_length = self.buffer_end;
-
-            for ch in self.buffer[..self.buffer_end].iter().rev() {
-                self.buffer_end -= 1;
-                // Found a new line character to break on
-                if *ch == LF_BYTE {
-                    result.push(self.buffer[self.buffer_end + 1..buffer_length].to_vec());
+            let buffer = self.buffer.get(..self.buffer_end).unwrap_or_default();
+            match memrchr(LF_BYTE, buffer) {
+                Some(pos) => {
+                    result.push(buffer.get(pos + 1..).unwrap_or_default().to_vec());
+                    self.buffer_end = pos;
                     break 'outer;
                 }
+                None => {
+                    result.push(buffer.to_vec());
+                    self.buffer_end = 0;
+                }
             }
-
-            result.push(self.buffer[..buffer_length].to_vec());
         }
 
-        Ok(Some(result.into_iter().rev().flatten().collect()))
+        result.reverse();
+        Ok(Some(if result.len() == 1 {
+            result.swap_remove(0)
+        } else {
+            result.concat()
+        }))
     }
 }
 
@@ -477,34 +496,7 @@ impl<R: Read + Seek> Iterator for RawRevLines<R> {
     }
 }
 
-pub struct RevLines<R>(RawRevLines<R>);
-
-impl<R: Read + Seek> RevLines<R> {
-    /// Create a new `RawRevLines` struct from a Reader.
-    /// Internal buffering for iteration will default to 4096 bytes at a time.
-    pub fn new(reader: R) -> RevLines<R> {
-        RevLines(RawRevLines::new(reader))
-    }
-
-    /// Create a new `RawRevLines` struct from a Reader`.
-    /// Internal buffering for iteration will use `cap` bytes at a time.
-    pub fn with_capacity(cap: usize, reader: R) -> RevLines<R> {
-        RevLines(RawRevLines::with_capacity(cap, reader))
-    }
-}
-
-impl<R: Read + Seek> Iterator for RevLines<R> {
-    type Item = Result<String, std::io::Error>;
-
-    fn next(&mut self) -> Option<Result<String, std::io::Error>> {
-        let line = match self.0.next_line().transpose()? {
-            Ok(line) => line,
-            Err(error) => return Some(Err(error)),
-        };
-
-        Some(
-            String::from_utf8(line)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8")),
-        )
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/jmap/src/registry/mapping/log/tests.rs"]
+mod tests;

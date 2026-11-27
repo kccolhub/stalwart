@@ -5,13 +5,28 @@
  */
 
 use crate::{Store, registry::bootstrap::Bootstrap};
+use registry::schema::structs::DataStore;
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
 use registry::schema::{
     prelude::ObjectType,
-    structs::{DataStore, MetricsStore, TracingStore},
+    structs::{MetricsStore, TracingStore},
 };
+// SPDX-SnippetEnd
 
 #[allow(unreachable_patterns)]
 impl Store {
+    pub fn report_cluster(&self, bp: &mut Bootstrap) {
+        #[cfg(feature = "foundation")]
+        if let Store::FoundationDb(store) = self {
+            store.report_opened(bp);
+        }
+        #[cfg(not(feature = "foundation"))]
+        let _ = bp;
+    }
+
     pub async fn build(config: DataStore) -> Result<Self, String> {
         #[allow(unreachable_patterns)]
         match config {
@@ -33,15 +48,23 @@ impl Store {
         }
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub async fn build_tracing(bp: &mut Bootstrap) -> Option<Self> {
         let result = match bp.setting_infallible::<TracingStore>().await {
             TracingStore::Disabled => Ok(None),
             TracingStore::Default => Ok(Some(bp.data_store.clone())),
             #[cfg(feature = "foundation")]
             TracingStore::FoundationDb(store) => {
-                crate::backend::foundationdb::FdbStore::open(store)
-                    .await
-                    .map(Some)
+                crate::backend::foundationdb::FdbStore::open_shared(
+                    store,
+                    bp,
+                    ObjectType::TracingStore.singleton(),
+                )
+                .await
+                .map(Some)
             }
             #[cfg(feature = "postgres")]
             TracingStore::PostgreSql(store) => crate::backend::postgres::PostgresStore::open(store)
@@ -63,15 +86,20 @@ impl Store {
         }
     }
 
+    #[cfg(feature = "enterprise")]
     pub async fn build_metrics(bp: &mut Bootstrap) -> Option<Self> {
         let result = match bp.setting_infallible::<MetricsStore>().await {
             MetricsStore::Disabled => Ok(None),
             MetricsStore::Default => Ok(Some(bp.data_store.clone())),
             #[cfg(feature = "foundation")]
             MetricsStore::FoundationDb(store) => {
-                crate::backend::foundationdb::FdbStore::open(store)
-                    .await
-                    .map(Some)
+                crate::backend::foundationdb::FdbStore::open_shared(
+                    store,
+                    bp,
+                    ObjectType::MetricsStore.singleton(),
+                )
+                .await
+                .map(Some)
             }
             #[cfg(feature = "postgres")]
             MetricsStore::PostgreSql(store) => crate::backend::postgres::PostgresStore::open(store)
@@ -92,4 +120,5 @@ impl Store {
             }
         }
     }
+    // SPDX-SnippetEnd
 }

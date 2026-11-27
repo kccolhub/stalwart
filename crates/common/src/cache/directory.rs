@@ -5,9 +5,10 @@
  */
 
 use crate::{Server, auth::DomainCache, cache::invalidate::CacheInvalidationBuilder};
+use compact_str::CompactString;
 use registry::{
     schema::{
-        prelude::{Object, ObjectType},
+        prelude::{Object, ObjectInner, ObjectType},
         structs::{
             Account, Credential, EmailAlias, GroupAccount, PasswordCredential, Roles, UserAccount,
             UserRoles,
@@ -17,6 +18,12 @@ use registry::{
 };
 use std::sync::Arc;
 use store::registry::write::{RegistryWrite, RegistryWriteResult};
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use registry::schema::enums::TenantStorageQuota;
+// SPDX-SnippetEnd
 use trc::AddContext;
 use types::id::Id;
 
@@ -30,6 +37,14 @@ impl Server {
         &self,
         account: directory::Account,
     ) -> trc::Result<AccountWithId> {
+        Box::pin(self.sync_account(account)).await
+    }
+
+    pub async fn synchronize_group(&self, group: directory::Group) -> trc::Result<u32> {
+        Box::pin(self.sync_group(group)).await
+    }
+
+    async fn sync_account(&self, account: directory::Account) -> trc::Result<AccountWithId> {
         let (local, domain) = self.validate_address(&account.email).await?;
 
         match self
@@ -73,48 +88,45 @@ impl Server {
                 }
                 // SPDX-SnippetEnd
 
-                let mut updated_account = Account::from(current_account.clone())
-                    .into_user()
-                    .ok_or_else(|| {
-                        trc::AuthEvent::Error
+                let current_user = match &current_account.inner {
+                    ObjectInner::Account(current) if let Account::User(user) = current.as_ref() => {
+                        user
+                    }
+                    _ => {
+                        return Err(trc::AuthEvent::Error
                             .into_err()
                             .details(
                                 "Account ID from directory does not correspond to a user account",
                             )
                             .ctx(trc::Key::AccountName, account.email.clone())
-                            .ctx(trc::Key::AccountId, account_id)
-                    })?;
+                            .ctx(trc::Key::AccountId, account_id));
+                    }
+                };
 
-                let mut has_changes = false;
-                if let Some(secret) = account.secret
-                    && secret != updated_account.password().unwrap_or_default()
-                {
-                    has_changes = true;
-                    updated_account.set_password(secret);
-                }
-                if account.description.is_some()
-                    && account.description != updated_account.description
-                {
-                    updated_account.description = account.description;
-                    has_changes = true;
-                }
+                let secret = account
+                    .secret
+                    .filter(|secret| secret != current_user.password().unwrap_or_default());
+                let description = account
+                    .description
+                    .filter(|description| current_user.description.as_ref() != Some(description));
+                let mut new_aliases = Vec::new();
                 for alias in account.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
-                        && alias_domain.id_tenant == domain.id_tenant
+                        && alias_domain.is_same_tenant(&domain)
                         && self
                             .rcpt_id_from_parts(local, alias_domain.id)
                             .await?
                             .is_none()
                     {
-                        updated_account.aliases.push(EmailAlias {
+                        new_aliases.push(EmailAlias {
                             name: local.to_string(),
                             domain_id: Id::from(alias_domain.id),
-                            enabled: true,
+                            enable: true,
                             description: None,
                         });
-                        has_changes = true;
                     }
                 }
+                let mut new_member_group_ids = None;
                 if let Some(groups) = account.groups {
                     let mut member_group_ids = Vec::with_capacity(groups.len());
                     for email in groups {
@@ -128,18 +140,35 @@ impl Server {
                             .into(),
                         );
                     }
-                    if updated_account.member_group_ids.len() != member_group_ids.len()
-                        || !updated_account
+                    if current_user.member_group_ids.len() != member_group_ids.len()
+                        || !current_user
                             .member_group_ids
                             .iter()
                             .all(|id| member_group_ids.contains(id))
                     {
-                        updated_account.member_group_ids = member_group_ids.into();
-                        has_changes = true;
+                        new_member_group_ids = Some(member_group_ids);
                     }
                 }
 
+                let has_changes = secret.is_some()
+                    || description.is_some()
+                    || !new_aliases.is_empty()
+                    || new_member_group_ids.is_some();
+
                 if has_changes {
+                    let mut updated_account = current_user.clone();
+                    if let Some(secret) = secret {
+                        updated_account.set_password(secret);
+                    }
+                    if description.is_some() {
+                        updated_account.description = description;
+                    }
+                    for alias in new_aliases {
+                        updated_account.aliases.push(alias);
+                    }
+                    if let Some(member_group_ids) = new_member_group_ids {
+                        updated_account.member_group_ids = member_group_ids.into();
+                    }
                     let updated_account = Object::from(Account::User(updated_account));
                     match self
                         .registry()
@@ -172,7 +201,7 @@ impl Server {
                 } else {
                     Ok(AccountWithId {
                         id: account_id,
-                        account: Account::User(updated_account),
+                        account: Account::from(current_account),
                     })
                 }
             }
@@ -188,14 +217,17 @@ impl Server {
                             "Accounts in this domain are provisioned through SCIM, ",
                             "just-in-time provisioning is disabled"
                         ))
-                        .ctx(trc::Key::Domain, domain.name().to_string()));
+                        .ctx(trc::Key::Domain, CompactString::from(domain.name())));
                 }
+                #[cfg(feature = "enterprise")]
+                self.assert_can_provision(&domain, TenantStorageQuota::MaxAccounts)
+                    .await?;
                 // SPDX-SnippetEnd
 
                 let mut aliases = Vec::with_capacity(account.email_aliases.len());
                 for alias in account.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
-                        && alias_domain.id_tenant == domain.id_tenant
+                        && alias_domain.is_same_tenant(&domain)
                         && self
                             .rcpt_id_from_parts(local, alias_domain.id)
                             .await?
@@ -204,7 +236,7 @@ impl Server {
                         aliases.push(EmailAlias {
                             name: local.to_string(),
                             domain_id: Id::from(alias_domain.id),
-                            enabled: true,
+                            enable: true,
                             description: None,
                         });
                     }
@@ -228,7 +260,12 @@ impl Server {
                     created_at: UTCDateTime::now(),
                     description: account.description,
                     member_group_ids: member_group_ids.into(),
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
                     member_tenant_id: domain.id_tenant.map(Id::from),
+                    // SPDX-SnippetEnd
                     roles: UserRoles::User,
                     credentials: List::from_iter(account.secret.map(|secret| {
                         Credential::Password(PasswordCredential {
@@ -239,17 +276,6 @@ impl Server {
                     })),
                     ..Default::default()
                 }));
-
-                // SPDX-SnippetBegin
-                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-                // SPDX-License-Identifier: LicenseRef-SEL
-                #[cfg(feature = "enterprise")]
-                if self.core.is_enterprise_edition() && !self.can_create_account().await? {
-                    return Err(trc::AuthEvent::Error.into_err().details(
-                        "Account creation not possible: license key account limit reached",
-                    ));
-                }
-                // SPDX-SnippetEnd
 
                 match self
                     .registry()
@@ -279,7 +305,7 @@ impl Server {
         }
     }
 
-    pub async fn synchronize_group(&self, group: directory::Group) -> trc::Result<u32> {
+    async fn sync_group(&self, group: directory::Group) -> trc::Result<u32> {
         let (local, domain) = self.validate_address(&group.email).await?;
 
         match self
@@ -287,6 +313,25 @@ impl Server {
             .await
             .caused_by(trc::location!())?
         {
+            Some(account_id) if group.description.is_none() && group.email_aliases.is_empty() => {
+                match self
+                    .try_account(account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                {
+                    Some(account) if account.is_group_account() => Ok(account_id),
+                    Some(_) => Err(trc::AuthEvent::Error
+                        .into_err()
+                        .details("Account ID from directory does not correspond to a group account")
+                        .ctx(trc::Key::AccountName, group.email)
+                        .ctx(trc::Key::AccountId, account_id)),
+                    None => Err(trc::AuthEvent::Error
+                        .into_err()
+                        .details("Account ID from directory does not exist in registry")
+                        .ctx(trc::Key::AccountName, group.email)
+                        .ctx(trc::Key::AccountId, account_id)),
+                }
+            }
             Some(account_id) => {
                 let current_account = self
                     .registry()
@@ -307,7 +352,8 @@ impl Server {
                 if domain.allows_scim_provisioning() && self.core.is_enterprise_edition() {
                     return if matches!(
                         &current_account.inner,
-                        registry::schema::prelude::ObjectInner::Account(Account::Group(_))
+                        registry::schema::prelude::ObjectInner::Account(account)
+                            if matches!(account.as_ref(), Account::Group(_))
                     ) {
                         Ok(account_id)
                     } else {
@@ -341,7 +387,7 @@ impl Server {
                 }
                 for alias in group.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
-                        && alias_domain.id_tenant == domain.id_tenant
+                        && alias_domain.is_same_tenant(&domain)
                         && self
                             .rcpt_id_from_parts(local, alias_domain.id)
                             .await?
@@ -350,7 +396,7 @@ impl Server {
                         updated_account.aliases.push(EmailAlias {
                             name: local.to_string(),
                             domain_id: Id::from(alias_domain.id),
-                            enabled: true,
+                            enable: true,
                             description: None,
                         });
                         has_changes = true;
@@ -400,14 +446,17 @@ impl Server {
                             "Groups in this domain are provisioned through SCIM, ",
                             "just-in-time provisioning is disabled"
                         ))
-                        .ctx(trc::Key::Domain, domain.name().to_string()));
+                        .ctx(trc::Key::Domain, CompactString::from(domain.name())));
                 }
+                #[cfg(feature = "enterprise")]
+                self.assert_can_provision(&domain, TenantStorageQuota::MaxGroups)
+                    .await?;
                 // SPDX-SnippetEnd
 
                 let mut aliases = Vec::with_capacity(group.email_aliases.len());
                 for alias in group.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
-                        && alias_domain.id_tenant == domain.id_tenant
+                        && alias_domain.is_same_tenant(&domain)
                         && self
                             .rcpt_id_from_parts(local, alias_domain.id)
                             .await?
@@ -416,7 +465,7 @@ impl Server {
                         aliases.push(EmailAlias {
                             name: local.to_string(),
                             domain_id: Id::from(alias_domain.id),
-                            enabled: true,
+                            enable: true,
                             description: None,
                         });
                     }
@@ -428,21 +477,15 @@ impl Server {
                     aliases: aliases.into(),
                     created_at: UTCDateTime::now(),
                     description: group.description,
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
                     member_tenant_id: domain.id_tenant.map(Id::from),
+                    // SPDX-SnippetEnd
                     roles: Roles::Default,
                     ..Default::default()
                 }));
-
-                // SPDX-SnippetBegin
-                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-                // SPDX-License-Identifier: LicenseRef-SEL
-                #[cfg(feature = "enterprise")]
-                if self.core.is_enterprise_edition() && !self.can_create_account().await? {
-                    return Err(trc::AuthEvent::Error.into_err().details(
-                        "Account creation not possible: license key account limit reached",
-                    ));
-                }
-                // SPDX-SnippetEnd
 
                 match self
                     .registry()
@@ -469,6 +512,42 @@ impl Server {
         }
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
+    async fn assert_can_provision(
+        &self,
+        domain: &DomainCache,
+        quota: TenantStorageQuota,
+    ) -> trc::Result<()> {
+        if !self.core.is_enterprise_edition() {
+            return Ok(());
+        }
+        if !self.can_create_account().await? {
+            return Err(trc::AuthEvent::Error
+                .into_err()
+                .details("Account creation not possible: license key account limit reached"));
+        }
+        if let Some(tenant_id) = domain.id_tenant
+            && let Some(reached) = self
+                .tenant_quota_reached(tenant_id, quota)
+                .await
+                .caused_by(trc::location!())?
+        {
+            return Err(trc::AuthEvent::Error
+                .into_err()
+                .details(format!(
+                    "Account creation not possible: tenant quota of {} {} reached",
+                    reached.limit, reached.objects
+                ))
+                .ctx(trc::Key::Domain, CompactString::from(domain.name()))
+                .ctx(trc::Key::Limit, reached.limit));
+        }
+        Ok(())
+    }
+    // SPDX-SnippetEnd
+
     async fn validate_address<'x>(
         &self,
         email: &'x str,
@@ -488,12 +567,12 @@ impl Server {
                     trc::AuthEvent::Error
                         .into_err()
                         .details("Account domain does not exist or has been disabled")
-                        .ctx(trc::Key::Domain, domain.to_string())
+                        .ctx(trc::Key::Domain, CompactString::from(domain))
                 }),
             None => {
                 trc::event!(
                     Auth(trc::AuthEvent::Warning),
-                    AccountName = email.to_string().clone(),
+                    AccountName = CompactString::from(email),
                     Details = "Directory account is not an email, appended default domain",
                 );
                 self.domain_by_id(self.core.email.default_domain_id)

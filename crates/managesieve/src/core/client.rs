@@ -5,14 +5,16 @@
  */
 
 use super::{Command, ResponseCode, SerializeResponse, Session, State};
-use common::{
-    KV_RATE_LIMIT_IMAP,
-    network::{SessionResult, SessionStream},
-};
+use common::network::{SessionResult, SessionStream, ready_or_timeout};
+use compact_str::format_compact;
 use imap_proto::receiver::{self, Request};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use trc::{AddContext, SecurityEvent};
 use types::{collection::Collection, field::SieveField};
+
+const UNAUTHENTICATED_LITERAL_BYE: &[u8] =
+    b"BYE \"Literal exceeds the maximum size allowed before authentication.\"\r\n";
 
 impl<T: SessionStream> Session<T> {
     pub async fn ingest(&mut self, bytes: &[u8]) -> SessionResult {
@@ -22,6 +24,22 @@ impl<T: SessionStream> Session<T> {
 
         loop {
             match self.receiver.parse(&mut bytes) {
+                Ok(_)
+                    if matches!(
+                        self.state,
+                        State::NotAuthenticated {
+                            sasl_failure: Some(_),
+                            ..
+                        }
+                    ) =>
+                {
+                    if let Some(failure) = self.state.take_sasl_failure()
+                        && let Err(err) = self.write_error(failure).await
+                    {
+                        trc::error!(err.span_id(self.session_id));
+                        return SessionResult::Close;
+                    }
+                }
                 Ok(request) => match self.validate_request(request).await {
                     Ok(request) => {
                         requests.push(request);
@@ -47,6 +65,35 @@ impl<T: SessionStream> Session<T> {
                     break;
                 }
                 Err(receiver::Error::Error { response }) => {
+                    if self.receiver.is_discarding() {
+                        if matches!(self.state, State::NotAuthenticated { .. }) {
+                            trc::error!(response.span_id(self.session_id));
+                            self.write(UNAUTHENTICATED_LITERAL_BYE).await.ok();
+                            return SessionResult::Close;
+                        }
+
+                        let refusal = trc::ManageSieveEvent::Error
+                            .into_err()
+                            .details(format_compact!(
+                                "Literal exceeds the maximum request size of {} bytes.",
+                                self.receiver.max_request_size
+                            ))
+                            .code(ResponseCode::QuotaMaxSize);
+                        if let Err(err) = self.write_error(refusal).await {
+                            trc::error!(err.span_id(self.session_id));
+                            return SessionResult::Close;
+                        }
+                        continue;
+                    }
+
+                    if let Some(failure) = self.state.take_sasl_failure() {
+                        if let Err(err) = self.write_error(failure).await {
+                            trc::error!(err.span_id(self.session_id));
+                            return SessionResult::Close;
+                        }
+                        break;
+                    }
+
                     // Check for port scanners
                     if matches!(
                         (&self.state, response.key(trc::Key::Code)),
@@ -97,7 +144,7 @@ impl<T: SessionStream> Session<T> {
                 Command::CheckScript => self.handle_checkscript(request).await,
                 Command::HaveSpace => self.handle_havespace(request).await,
                 Command::Capability => self.handle_capability("").await,
-                Command::Authenticate => Box::pin(self.handle_authenticate(request)).await,
+                Command::Authenticate => self.handle_authenticate(request).await,
                 Command::StartTls => self.handle_start_tls().await,
                 Command::Logout => self.handle_logout().await,
                 Command::Noop => self.handle_noop(request).await,
@@ -180,29 +227,17 @@ impl<T: SessionStream> Session<T> {
             | Command::CheckScript
             | Command::Unauthenticate => {
                 if let State::Authenticated { access_token, .. } = &self.state {
-                    if let Some(rate) = &self.server.core.imap.rate_requests {
-                        if self
-                            .server
-                            .in_memory_store()
-                            .is_rate_allowed(
-                                KV_RATE_LIMIT_IMAP,
-                                &access_token.account_id().to_be_bytes(),
-                                rate,
-                                true,
-                            )
-                            .await
-                            .caused_by(trc::location!())?
-                            .is_none()
-                        {
-                            Ok(command)
-                        } else {
-                            Err(trc::LimitEvent::TooManyRequests
-                                .into_err()
-                                .code(ResponseCode::TryLater))
-                        }
-                    } else {
-                        Ok(command)
+                    if !self.server.is_access_token_current(access_token) {
+                        Box::pin(
+                            self.server
+                                .assert_session_access(access_token, self.remote_addr),
+                        )
+                        .await?;
                     }
+                    self.server
+                        .is_imap_request_allowed(access_token)
+                        .await
+                        .map(|_| command)
                 } else {
                     Err(trc::ManageSieveEvent::Error
                         .into_err()
@@ -214,6 +249,14 @@ impl<T: SessionStream> Session<T> {
 }
 
 impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
+    pub(crate) fn timeout(&self) -> Duration {
+        if !matches!(self.state, State::NotAuthenticated { .. }) {
+            self.server.core.imap.timeout_auth
+        } else {
+            self.server.core.imap.timeout_unauth
+        }
+    }
+
     #[inline(always)]
     pub async fn write(&mut self, bytes: &[u8]) -> trc::Result<()> {
         trc::event!(
@@ -223,20 +266,29 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
             Contents = trc::Value::from_maybe_string(bytes),
         );
 
-        self.stream.write_all(bytes).await.map_err(|err| {
-            trc::NetworkEvent::WriteError
+        let timeout = self.timeout();
+        let stream = &mut self.stream;
+        ready_or_timeout(timeout, async {
+            stream.write_all(bytes).await.map_err(|err| {
+                trc::NetworkEvent::WriteError
+                    .into_err()
+                    .reason(err)
+                    .caused_by(trc::location!())
+            })?;
+            stream.flush().await.map_err(|err| {
+                trc::NetworkEvent::FlushError
+                    .into_err()
+                    .reason(err)
+                    .caused_by(trc::location!())
+            })
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(trc::NetworkEvent::Timeout
                 .into_err()
-                .reason(err)
-                .caused_by(trc::location!())
-        })?;
-        self.stream.flush().await.map_err(|err| {
-            trc::NetworkEvent::FlushError
-                .into_err()
-                .reason(err)
-                .caused_by(trc::location!())
-        })?;
-
-        Ok(())
+                .details("Write timed out")
+                .caused_by(trc::location!()))
+        })
     }
 
     pub async fn write_error(&mut self, error: trc::Error) -> trc::Result<()> {

@@ -8,14 +8,20 @@ use super::Request;
 use crate::{
     error::request::{RequestError, RequestErrorType, RequestLimitError},
     object::AnyId,
-    request::{Call, deserialize::DeserializeArguments},
+    request::{
+        Call, RequestMethod,
+        parser::{CallList, LenientCall, json_error_event},
+    },
     response::{Response, ResponseMethod, serialize::serialize_hex, status::PushObject},
 };
+use ahash::AHashMap;
+use compact_str::{CompactString, ToCompactString, format_compact};
 use serde::{
     Deserialize, Deserializer,
     de::{self, MapAccess, Visitor},
 };
-use std::{borrow::Cow, collections::HashMap, fmt};
+use simdutf8::basic::from_utf8;
+use std::{borrow::Cow, fmt, marker::PhantomData};
 use types::type_state::DataType;
 
 #[derive(Debug)]
@@ -36,13 +42,13 @@ pub struct WebSocketResponse<'x> {
     #[serde(serialize_with = "serialize_hex")]
     session_state: u32,
 
-    #[serde(rename(deserialize = "createdIds"))]
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    created_ids: HashMap<String, AnyId>,
+    #[serde(rename = "createdIds")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_ids: Option<AHashMap<String, AnyId>>,
 
     #[serde(rename = "requestId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<String>,
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -96,6 +102,17 @@ pub enum WebSocketRequestErrorType {
     RequestError,
 }
 
+#[derive(Debug)]
+pub struct WebSocketParseError {
+    pub error: trc::Error,
+    pub request_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WebSocketMessageId {
+    id: Option<String>,
+}
+
 enum MessageType {
     Request,
     PushEnable,
@@ -104,22 +121,77 @@ enum MessageType {
 }
 
 impl<'x> WebSocketMessage<'x> {
-    pub fn parse(json: &'x [u8], max_calls: usize, max_size: usize) -> trc::Result<Self> {
-        if json.len() <= max_size {
-            match serde_json::from_slice::<Self>(json) {
-                Ok(WebSocketMessage::Request(req))
-                    if req.request.method_calls.len() > max_calls =>
-                {
-                    Err(trc::LimitEvent::CallsIn.into_err())
-                }
-                Ok(msg) => Ok(msg),
-                Err(err) => Err(trc::JmapEvent::NotRequest
-                    .into_err()
-                    .details(format!("Invalid WebSocket JMAP request {err}"))),
-            }
-        } else {
-            Err(trc::LimitEvent::SizeRequest.into_err())
+    #[cold]
+    #[inline(never)]
+    fn parse_lenient(
+        text: &'x str,
+        err: serde_json::Error,
+    ) -> Result<Self, (trc::JmapEvent, CompactString)> {
+        serde_json::from_str::<LenientWebSocketMessage>(text)
+            .map(|message| message.0)
+            .map_err(|_| (json_error_event(text), err.to_compact_string()))
+    }
+
+    pub fn parse(
+        json: &'x [u8],
+        max_calls: usize,
+        max_size: usize,
+    ) -> Result<Self, WebSocketParseError> {
+        if json.len() > max_size {
+            return Err(WebSocketParseError {
+                error: trc::LimitEvent::SizeRequest.into_err(),
+                request_id: None,
+            });
         }
+        let text = from_utf8(json).map_err(|err| {
+            WebSocketParseError::invalid(trc::JmapEvent::NotJson, err.to_compact_string(), None)
+        })?;
+        match serde_json::from_str::<Self>(text).or_else(|err| Self::parse_lenient(text, err)) {
+            Ok(WebSocketMessage::Request(mut req)) => {
+                let error = if let Some(capability) = req.request.unknown_capability.take() {
+                    trc::JmapEvent::UnknownCapability
+                        .into_err()
+                        .details(capability)
+                } else if req.request.method_calls.len() > max_calls {
+                    trc::LimitEvent::CallsIn.into_err()
+                } else {
+                    return Ok(WebSocketMessage::Request(req));
+                };
+                Err(WebSocketParseError {
+                    error,
+                    request_id: req.id,
+                })
+            }
+            Ok(msg) => Ok(msg),
+            Err((event, err)) => Err(WebSocketParseError::invalid(
+                event,
+                err,
+                WebSocketMessageId::parse(text),
+            )),
+        }
+    }
+}
+
+impl WebSocketParseError {
+    #[cold]
+    #[inline(never)]
+    fn invalid(event: trc::JmapEvent, err: CompactString, request_id: Option<String>) -> Self {
+        WebSocketParseError {
+            error: event
+                .into_err()
+                .details(format_compact!("Invalid WebSocket JMAP request {err}")),
+            request_id,
+        }
+    }
+}
+
+impl WebSocketMessageId {
+    #[cold]
+    #[inline(never)]
+    fn parse(text: &str) -> Option<String> {
+        serde_json::from_str::<WebSocketMessageId>(text)
+            .ok()
+            .and_then(|message| message.id)
     }
 }
 
@@ -128,13 +200,32 @@ impl<'de: 'x, 'x: 'de> Deserialize<'de> for WebSocketMessage<'x> {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(WebSocketMessageVisitor)
+        deserializer.deserialize_map(WebSocketMessageVisitor::<Vec<Call<RequestMethod<'x>>>> {
+            _calls: PhantomData,
+        })
     }
 }
 
-struct WebSocketMessageVisitor;
+struct LenientWebSocketMessage<'x>(WebSocketMessage<'x>);
 
-impl<'de> Visitor<'de> for WebSocketMessageVisitor {
+impl<'de> Deserialize<'de> for LenientWebSocketMessage<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_map(WebSocketMessageVisitor::<Vec<LenientCall<'de>>> {
+                _calls: PhantomData,
+            })
+            .map(LenientWebSocketMessage)
+    }
+}
+
+struct WebSocketMessageVisitor<C> {
+    _calls: PhantomData<C>,
+}
+
+impl<'de, C: CallList<'de>> Visitor<'de> for WebSocketMessageVisitor<C> {
     type Value = WebSocketMessage<'de>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -172,7 +263,7 @@ impl<'de> Visitor<'de> for WebSocketMessageVisitor {
                     request.id = map.next_value()?;
                 },
                 _ => {
-                    request.request.deserialize_argument(key, &mut map)?;
+                    request.request.deserialize_field::<V, C>(key, &mut map)?;
                     found_request_keys = true;
                 }
             );
@@ -193,10 +284,11 @@ impl<'de> Visitor<'de> for WebSocketMessageVisitor {
 
 impl MessageType {
     fn parse(s: &str) -> Self {
-        hashify::tiny_map!(s.as_bytes(),
-            b"Request" => MessageType::Request,
-            b"WebSocketPushEnable" => MessageType::PushEnable,
-            b"WebSocketPushDisable" => MessageType::PushDisable,
+        hashify::fnc_map!(s.as_bytes(),
+            b"Request" => Some(MessageType::Request),
+            b"WebSocketPushEnable" => Some(MessageType::PushEnable),
+            b"WebSocketPushDisable" => Some(MessageType::PushDisable),
+            _ => None,
         )
         .unwrap_or(MessageType::None)
     }
@@ -231,13 +323,13 @@ impl<'x> WebSocketResponse<'x> {
             _type: WebSocketResponseType::Response,
             method_responses: response.method_responses,
             session_state: response.session_state,
-            created_ids: response.created_ids,
+            created_ids: response.echo_created_ids.then_some(response.created_ids),
             request_id,
         }
     }
 
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    pub fn to_json(&self) -> Result<String, sonic_rs::Error> {
+        sonic_rs::to_string(self)
     }
 }
 

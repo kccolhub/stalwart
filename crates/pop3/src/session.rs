@@ -13,9 +13,10 @@ use crate::{
 };
 use common::{
     BuildServer,
-    network::{SessionData, SessionManager, SessionResult, SessionStream},
+    network::{SessionData, SessionManager, SessionResult, SessionStream, ready_or_timeout},
 };
-use std::borrow::Cow;
+use compact_str::ToCompactString;
+use std::{borrow::Cow, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::server::TlsStream;
 
@@ -33,6 +34,7 @@ impl SessionManager for Pop3SessionManager {
                 state: State::NotAuthenticated {
                     auth_failures: 0,
                     username: None,
+                    sasl_failure: None,
                 },
                 stream: session.stream,
                 in_flight: session.in_flight,
@@ -67,11 +69,7 @@ impl<T: SessionStream> Session<T> {
         loop {
             tokio::select! {
                 result = tokio::time::timeout(
-                    if !matches!(self.state, State::NotAuthenticated {..}) {
-                        self.server.core.imap.timeout_auth
-                    } else {
-                        self.server.core.imap.timeout_unauth
-                    },
+                    self.timeout(),
                     self.stream.read(&mut buf)) => {
                     match result {
                         Ok(Ok(bytes_read)) => {
@@ -98,7 +96,7 @@ impl<T: SessionStream> Session<T> {
                             trc::event!(
                                 Network(trc::NetworkEvent::ReadError),
                                 SpanId = self.session_id,
-                                Reason = err.to_string()    ,
+                                Reason = err.to_compact_string()    ,
                                 CausedBy = trc::location!()
                             );
                             break;
@@ -132,7 +130,8 @@ impl<T: SessionStream> Session<T> {
         false
     }
 
-    pub async fn into_tls(self) -> Result<Session<TlsStream<T>>, ()> {
+    pub async fn into_tls(mut self) -> Result<Session<TlsStream<T>>, ()> {
+        self.state.take_sasl_failure();
         Ok(Session {
             stream: self
                 .instance
@@ -150,6 +149,14 @@ impl<T: SessionStream> Session<T> {
 }
 
 impl<T: SessionStream> Session<T> {
+    fn timeout(&self) -> Duration {
+        if !matches!(self.state, State::NotAuthenticated { .. }) {
+            self.server.core.imap.timeout_auth
+        } else {
+            self.server.core.imap.timeout_unauth
+        }
+    }
+
     pub async fn write_bytes(&mut self, bytes: impl AsRef<[u8]>) -> trc::Result<()> {
         let bytes = bytes.as_ref();
 
@@ -160,17 +167,28 @@ impl<T: SessionStream> Session<T> {
             Contents = trc::Value::from_maybe_string(bytes),
         );
 
-        self.stream.write_all(bytes.as_ref()).await.map_err(|err| {
-            trc::NetworkEvent::WriteError
+        let timeout = self.timeout();
+        let stream = &mut self.stream;
+        ready_or_timeout(timeout, async {
+            stream.write_all(bytes).await.map_err(|err| {
+                trc::NetworkEvent::WriteError
+                    .into_err()
+                    .reason(err)
+                    .caused_by(trc::location!())
+            })?;
+            stream.flush().await.map_err(|err| {
+                trc::NetworkEvent::WriteError
+                    .into_err()
+                    .reason(err)
+                    .caused_by(trc::location!())
+            })
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(trc::NetworkEvent::Timeout
                 .into_err()
-                .reason(err)
-                .caused_by(trc::location!())
-        })?;
-        self.stream.flush().await.map_err(|err| {
-            trc::NetworkEvent::WriteError
-                .into_err()
-                .reason(err)
-                .caused_by(trc::location!())
+                .details("Write timed out")
+                .caused_by(trc::location!()))
         })
     }
 

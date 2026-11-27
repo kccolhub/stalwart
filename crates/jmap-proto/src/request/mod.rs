@@ -20,7 +20,9 @@ use crate::{
         get::GetRequest,
         import::ImportEmailRequest,
         lookup::BlobLookupRequest,
+        mdn::{MdnParseRequest, MdnSendRequest},
         parse::ParseRequest,
+        passkey::PasskeyRegistrationOptionsRequest,
         query::QueryRequest,
         query_changes::QueryChangesRequest,
         search_snippet::GetSearchSnippetRequest,
@@ -39,8 +41,10 @@ use crate::{
     },
     request::{capability::CapabilityIds, reference::MaybeIdReference},
 };
+use ahash::AHashMap;
+use compact_str::CompactString;
 use jmap_tools::{Null, Value};
-use std::{collections::HashMap, fmt::Debug, str::FromStr};
+use std::{fmt::Debug, str::FromStr};
 use types::id::Id;
 use utils::map::vec_map::VecMap;
 
@@ -60,7 +64,8 @@ where
 pub struct Request<'x> {
     pub using: CapabilityIds,
     pub method_calls: Vec<Call<RequestMethod<'x>>>,
-    pub created_ids: Option<HashMap<String, AnyId>>,
+    pub created_ids: Option<AHashMap<String, AnyId>>,
+    pub(crate) unknown_capability: Option<CompactString>,
 }
 
 #[derive(Debug)]
@@ -78,10 +83,13 @@ pub enum RequestMethod<'x> {
     Copy(CopyRequestMethod<'x>),
     ImportEmail(Box<ImportEmailRequest>),
     Parse(ParseRequestMethod),
+    MdnSend(Box<MdnSendRequest<'x>>),
+    MdnParse(Box<MdnParseRequest>),
     Query(QueryRequestMethod),
     QueryChanges(QueryChangesRequestMethod),
     SearchSnippet(Box<GetSearchSnippetRequest>),
     ValidateScript(Box<ValidateSieveScriptRequest>),
+    PasskeyRegistrationOptions(Box<PasskeyRegistrationOptionsRequest>),
     LookupBlob(Box<BlobLookupRequest>),
     UploadBlob(Box<BlobUploadRequest>),
     Echo(Value<'x, Null, Null>),
@@ -233,6 +241,7 @@ impl Default for Request<'_> {
             using: CapabilityIds::default(),
             method_calls: Vec::new(),
             created_ids: None,
+            unknown_capability: None,
         }
     }
 }

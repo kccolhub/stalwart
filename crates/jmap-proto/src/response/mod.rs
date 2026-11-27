@@ -5,9 +5,12 @@
  */
 
 pub mod serialize;
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/jmap-proto/src/response/sonic_tests.rs"]
+mod sonic_tests;
 pub mod status;
 
-use self::serialize::serialize_hex;
 use crate::{
     error::method::MethodErrorWrapper,
     method::{
@@ -17,7 +20,9 @@ use crate::{
         get::GetResponse,
         import::ImportEmailResponse,
         lookup::BlobLookupResponse,
+        mdn::{MdnParseResponse, MdnSendResponse},
         parse::ParseResponse,
+        passkey::PasskeyRegistrationOptionsResponse,
         query::QueryResponse,
         query_changes::QueryChangesResponse,
         search_snippet::GetSearchSnippetResponse,
@@ -52,8 +57,9 @@ use crate::{
     },
     request::{Call, method::MethodName},
 };
+use ahash::AHashMap;
 use jmap_tools::{Null, Value};
-use std::collections::HashMap;
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
@@ -64,10 +70,13 @@ pub enum ResponseMethod<'x> {
     Copy(CopyResponseMethod),
     ImportEmail(ImportEmailResponse),
     Parse(ParseResponseMethod),
+    MdnSend(MdnSendResponse),
+    MdnParse(MdnParseResponse),
     QueryChanges(QueryChangesResponse),
     Query(QueryResponse),
     SearchSnippet(GetSearchSnippetResponse),
     ValidateScript(ValidateSieveScriptResponse),
+    PasskeyRegistrationOptions(Box<PasskeyRegistrationOptionsResponse>),
     LookupBlob(BlobLookupResponse),
     UploadBlob(BlobUploadResponse),
     Echo(Value<'x, Null, Null>),
@@ -137,6 +146,7 @@ pub enum ChangesResponseMethod {
     CalendarEvent(Box<ChangesResponse<CalendarEvent>>),
     CalendarEventNotification(Box<ChangesResponse<CalendarEventNotification>>),
     ShareNotification(Box<ChangesResponse<ShareNotification>>),
+    ParticipantIdentity(Box<ChangesResponse<ParticipantIdentity>>),
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -157,25 +167,43 @@ pub enum ParseResponseMethod {
     CalendarEvent(ParseResponse<CalendarEvent>),
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub struct Response<'x> {
-    #[serde(rename = "methodResponses")]
     pub method_responses: Vec<Call<ResponseMethod<'x>>>,
-
-    #[serde(rename = "sessionState")]
-    #[serde(serialize_with = "serialize_hex")]
     pub session_state: u32,
+    pub created_ids: AHashMap<String, AnyId>,
+    pub echo_created_ids: bool,
+}
 
-    #[serde(rename = "createdIds")]
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub created_ids: HashMap<String, AnyId>,
+impl Serialize for Response<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut response =
+            serializer.serialize_struct("Response", 2 + usize::from(self.echo_created_ids))?;
+        response.serialize_field("methodResponses", &self.method_responses)?;
+        response.serialize_field("sessionState", &format_args!("{:x}", self.session_state))?;
+        if self.echo_created_ids {
+            response.serialize_field("createdIds", &self.created_ids)?;
+        } else {
+            response.skip_field("createdIds")?;
+        }
+        response.end()
+    }
 }
 
 impl<'x> Response<'x> {
-    pub fn new(session_state: u32, created_ids: HashMap<String, AnyId>, capacity: usize) -> Self {
+    pub fn to_json(&self) -> Result<String, sonic_rs::Error> {
+        sonic_rs::to_string(self)
+    }
+
+    pub fn new(
+        session_state: u32,
+        created_ids: Option<AHashMap<String, AnyId>>,
+        capacity: usize,
+    ) -> Self {
         Response {
             session_state,
-            created_ids,
+            echo_created_ids: created_ids.is_some(),
+            created_ids: created_ids.unwrap_or_default(),
             method_responses: Vec::with_capacity(capacity),
         }
     }
@@ -425,6 +453,18 @@ impl<'x> From<CopyResponse<ContactCard>> for ResponseMethod<'x> {
     }
 }
 
+impl<'x> From<MdnSendResponse> for ResponseMethod<'x> {
+    fn from(value: MdnSendResponse) -> Self {
+        ResponseMethod::MdnSend(value)
+    }
+}
+
+impl<'x> From<MdnParseResponse> for ResponseMethod<'x> {
+    fn from(value: MdnParseResponse) -> Self {
+        ResponseMethod::MdnParse(value)
+    }
+}
+
 impl<'x> From<ImportEmailResponse> for ResponseMethod<'x> {
     fn from(value: ImportEmailResponse) -> Self {
         ResponseMethod::ImportEmail(value)
@@ -464,6 +504,12 @@ impl<'x> From<GetSearchSnippetResponse> for ResponseMethod<'x> {
 impl<'x> From<ValidateSieveScriptResponse> for ResponseMethod<'x> {
     fn from(value: ValidateSieveScriptResponse) -> Self {
         ResponseMethod::ValidateScript(value)
+    }
+}
+
+impl<'x> From<PasskeyRegistrationOptionsResponse> for ResponseMethod<'x> {
+    fn from(value: PasskeyRegistrationOptionsResponse) -> Self {
+        ResponseMethod::PasskeyRegistrationOptions(Box::new(value))
     }
 }
 

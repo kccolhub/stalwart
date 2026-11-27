@@ -5,17 +5,17 @@
  */
 
 use crate::{DavError, DavErrorCondition};
-use common::{DavResources, Server};
+use common::GroupwareResources;
 use dav_proto::schema::{
     property::{CardDavProperty, DavProperty, WebDavProperty},
     response::CardCondition,
 };
+use groupware::contact::write::{CardWriteError, assert_unique_uid};
 use hyper::StatusCode;
-use trc::AddContext;
-use types::{collection::Collection, field::ContactField};
 
 pub mod copy_move;
 pub mod delete;
+pub mod filter;
 pub mod get;
 pub mod mkcol;
 pub mod proppatch;
@@ -74,34 +74,34 @@ pub(crate) static CARD_ITEM_PROPS: [DavProperty; 20] = [
     }),
 ];
 
-pub(crate) async fn assert_is_unique_uid(
-    server: &Server,
-    resources: &DavResources,
-    account_id: u32,
+pub(crate) fn assert_is_unique_uid(
+    resources: &GroupwareResources,
     addressbook_id: u32,
     uid: Option<&str>,
 ) -> crate::Result<()> {
-    if let Some(uid) = uid {
-        let hits = server
-            .document_ids_matching(
-                account_id,
-                Collection::ContactCard,
-                ContactField::Uid,
-                uid.as_bytes(),
-            )
-            .await
-            .caused_by(trc::location!())?;
-        if !hits.is_empty() {
-            for path in resources.children(addressbook_id) {
-                if hits.contains(path.document_id()) {
-                    return Err(DavError::Condition(DavErrorCondition::new(
-                        StatusCode::PRECONDITION_FAILED,
-                        CardCondition::NoUidConflict(resources.format_resource(path).into()),
-                    )));
-                }
+    assert_unique_uid(resources, addressbook_id, uid).map_err(Into::into)
+}
+
+impl From<CardWriteError> for DavError {
+    fn from(err: CardWriteError) -> Self {
+        match err {
+            CardWriteError::NotFound => DavError::Code(StatusCode::NOT_FOUND),
+            CardWriteError::Forbidden | CardWriteError::UidChanged(None) => {
+                DavError::Code(StatusCode::FORBIDDEN)
             }
+            CardWriteError::UidChanged(Some(path))
+            | CardWriteError::UidConflict { href: path, .. } => {
+                DavError::Condition(DavErrorCondition::new(
+                    StatusCode::FORBIDDEN,
+                    CardCondition::NoUidConflict(path.into()),
+                ))
+            }
+            CardWriteError::Store(err) => DavError::Internal(err),
         }
     }
-
-    Ok(())
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/dav/src/card/tests.rs"]
+mod tests;

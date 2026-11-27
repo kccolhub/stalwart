@@ -10,22 +10,35 @@ use common::{
     auth::{AccessToken, Permissions, PermissionsGroup, permissions::BuildPermissions},
 };
 use directory::core::secret::{hash_secret, is_password_hash};
-use jmap_proto::error::set::SetError;
+use groupware::{cache::GroupwareCache, calendar::Calendar};
+use jmap_proto::error::set::{SetError, SetErrorType};
 use registry::{schema::structs::TaskStatus, types::datetime::UTCDateTime};
 use registry::{
     schema::{
-        enums::{AccountType, Permission, TenantStorageQuota},
+        enums::{AccountType, Permission},
         prelude::{MASKED_PASSWORD, ObjectType, Property},
         structs::{Account, Credential, Role, Task, TaskDestroyAccount},
     },
     types::EnumImpl,
 };
 use store::{
-    registry::{RegistryObjectCounter, RegistryQuery},
-    write::{BatchBuilder, RegistryClass, ValueClass, now},
+    ValueKey,
+    write::{Archive, ArchiveBytes, BatchBuilder, RegistryClass, ValueClass, now},
 };
 use trc::AddContext;
-use types::id::Id;
+use types::{
+    acl::{Acl, AclGrant},
+    collection::Collection,
+    id::Id,
+};
+use utils::map::bitmap::Bitmap;
+
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use registry::schema::{enums::TenantStorageQuota, prelude::ObjectInner};
+// SPDX-SnippetEnd
 
 #[derive(Clone, Copy)]
 pub enum AccountUpdate<'x> {
@@ -74,6 +87,23 @@ pub async fn validate_account(
         None
     };
 
+    if let AccountUpdate::Update(old_account) = old_account
+        && let Err(err) = validate_account_access(server, access_token, old_account).await?
+    {
+        return Ok(Err(err));
+    }
+
+    if let Account::Resource(resource) = account
+        && resource.delegate_ids.len() > server.core.groupware.max_shares_per_item
+    {
+        return Ok(Err(SetError::invalid_properties()
+            .with_property(Property::DelegateIds)
+            .with_description(format!(
+                "A resource can have at most {} delegates.",
+                server.core.groupware.max_shares_per_item
+            ))));
+    }
+
     let validate_permissions = match (&mut account, old_account) {
         (Account::User(account), AccountUpdate::Update(Account::User(old_account))) => {
             // Validate credentials
@@ -111,11 +141,11 @@ pub async fn validate_account(
                                     credential.secret = old_credential.secret.clone();
                                 }
                                 if credential
-                                    .otp_auth
+                                    .otp_url
                                     .as_ref()
-                                    .is_some_and(|otp_auth| otp_auth == MASKED_PASSWORD)
+                                    .is_some_and(|otp_url| otp_url == MASKED_PASSWORD)
                                 {
-                                    credential.otp_auth = old_credential.otp_auth.clone();
+                                    credential.otp_url = old_credential.otp_url.clone();
                                 }
 
                                 if credential.secret != old_credential.secret {
@@ -145,6 +175,7 @@ pub async fn validate_account(
                                         }
 
                                         credential.secret = hash_secret(
+                                            &server.inner.data.password_verifier,
                                             server.core.network.security.password_hash_algorithm,
                                             std::mem::take(&mut credential.secret).into_bytes(),
                                         )
@@ -169,6 +200,20 @@ pub async fn validate_account(
                                 if credential.secret != old_credential.secret {
                                     return Ok(Err(SetError::forbidden().with_description(
                                         "Cannot change app password or API credentials through this method.",
+                                    )));
+                                }
+                            }
+                            (
+                                Credential::Passkey(credential),
+                                Credential::Passkey(old_credential),
+                            ) => {
+                                if credential.key_id != old_credential.key_id
+                                    || credential.public_key != old_credential.public_key
+                                    || credential.algorithm != old_credential.algorithm
+                                    || credential.created_at != old_credential.created_at
+                                {
+                                    return Ok(Err(SetError::forbidden().with_description(
+                                        "Only the name of a passkey can be changed.",
                                     )));
                                 }
                             }
@@ -207,14 +252,10 @@ pub async fn validate_account(
         (Account::Group(account), AccountUpdate::Update(Account::Group(old_account))) => {
             account.permissions != old_account.permissions || account.roles != old_account.roles
         }
+        (Account::Resource(account), AccountUpdate::Update(Account::Resource(old_account))) => {
+            account.permissions != old_account.permissions || account.roles != old_account.roles
+        }
         (Account::User(account), AccountUpdate::Create(_)) => {
-            // Validate tenant quotas
-            if let Err(err) =
-                validate_tenant_quota(server, access_token, TenantStorageQuota::MaxAccounts).await?
-            {
-                return Ok(Err(err));
-            }
-
             // Validate credentials
             for (index, credential) in account.credentials.values_mut().enumerate() {
                 if let Err(err) = validate_credential_creation(
@@ -232,18 +273,8 @@ pub async fn validate_account(
 
             true
         }
-        (Account::Group(_), AccountUpdate::Create(_)) => {
-            // Validate tenant quotas
-            if let Err(err) =
-                validate_tenant_quota(server, access_token, TenantStorageQuota::MaxGroups).await?
-            {
-                return Ok(Err(err));
-            }
-
-            true
-        }
-        (Account::User(_), AccountUpdate::Update(Account::Group(_)))
-        | (Account::Group(_), AccountUpdate::Update(Account::User(_))) => {
+        (Account::Group(_) | Account::Resource(_), AccountUpdate::Create(_)) => true,
+        (_, AccountUpdate::Update(_)) => {
             return Ok(Err(SetError::invalid_properties()
                 .with_property(Property::Type)
                 .with_description(
@@ -270,6 +301,17 @@ pub async fn validate_account(
     }
 
     result
+}
+
+pub async fn validate_account_access(
+    server: &Server,
+    access_token: &AccessToken,
+    account: &Account,
+) -> trc::Result<Result<(), SetError<Property>>> {
+    server
+        .can_set_permissions(access_token, account)
+        .await
+        .map(|result| result.map_err(build_set_error))
 }
 
 async fn validate_credential_creation(
@@ -307,6 +349,7 @@ async fn validate_credential_creation(
                     .with_description(err)))
             } else {
                 credential.secret = hash_secret(
+                    &server.inner.data.password_verifier,
                     server.core.network.security.password_hash_algorithm,
                     std::mem::take(&mut credential.secret).into_bytes(),
                 )
@@ -322,38 +365,45 @@ async fn validate_credential_creation(
                     "Secondary credentials cannot be set directly.",
                 )))
         }
+        Credential::Passkey(_) => Ok(Err(SetError::invalid_properties()
+            .with_property(Property::Credentials)
+            .with_description("Passkeys can only be registered by the account owner."))),
     }
 }
 
+#[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
 pub(crate) async fn validate_role(
     server: &Server,
     access_token: &AccessToken,
     role: &mut Role,
     old_role: Option<&Role>,
 ) -> ValidationResult {
-    if old_role.is_none() {
-        // Validate tenant quotas
-        if let Err(err) =
-            validate_tenant_quota(server, access_token, TenantStorageQuota::MaxRoles).await?
-        {
-            return Ok(Err(err));
-        }
-    }
-
     if old_role.is_none_or(|old_role| {
         old_role.enabled_permissions != role.enabled_permissions
             || old_role.disabled_permissions != role.disabled_permissions
             || old_role.role_ids != role.role_ids
     }) {
-        Ok(access_token
-            .can_grant_permissions(
+        let permissions = match server
+            .add_role_permissions(
                 PermissionsGroup {
                     enabled: Permissions::from_permission(role.enabled_permissions.as_slice()),
                     disabled: Permissions::from_permission(role.disabled_permissions.as_slice()),
                     merge: false,
-                }
-                .finalize(),
+                },
+                role.role_ids.iter().map(|id| id.document_id()),
             )
+            .await
+        {
+            Ok(permissions) => permissions,
+            Err(err) if err.matches(trc::EventType::Auth(trc::AuthEvent::Error)) => {
+                return Ok(Err(
+                    SetError::new(SetErrorType::InvalidForeignKey).with_property(Property::RoleIds)
+                ));
+            }
+            Err(err) => return Err(err.caused_by(trc::location!())),
+        };
+        Ok(access_token
+            .can_grant_permissions(permissions.finalize())
             .map(|_| ObjectResponse::default())
             .map_err(build_set_error))
     } else {
@@ -365,78 +415,43 @@ pub(crate) async fn validate_role(
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
 #[cfg(feature = "enterprise")]
+pub fn tenant_object_quota(object: &ObjectInner) -> Option<TenantStorageQuota> {
+    match object {
+        ObjectInner::Account(account) => Some(match account.as_ref() {
+            Account::User(_) => TenantStorageQuota::MaxAccounts,
+            Account::Group(_) => TenantStorageQuota::MaxGroups,
+            Account::Resource(_) => TenantStorageQuota::MaxAccounts,
+        }),
+        ObjectInner::Domain(_) => Some(TenantStorageQuota::MaxDomains),
+        ObjectInner::MailingList(_) => Some(TenantStorageQuota::MaxMailingLists),
+        ObjectInner::Role(_) => Some(TenantStorageQuota::MaxRoles),
+        ObjectInner::OAuthClient(_) => Some(TenantStorageQuota::MaxOauthClients),
+        ObjectInner::DkimSignature(_) => Some(TenantStorageQuota::MaxDkimKeys),
+        ObjectInner::DnsServer(_) => Some(TenantStorageQuota::MaxDnsServers),
+        ObjectInner::Directory(_) => Some(TenantStorageQuota::MaxDirectories),
+        ObjectInner::AcmeProvider(_) => Some(TenantStorageQuota::MaxAcmeProviders),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "enterprise")]
 pub async fn validate_tenant_quota(
     server: &Server,
-    access_token: &AccessToken,
+    tenant_id: Option<u32>,
     quota: TenantStorageQuota,
 ) -> ValidationResult {
-    if let Some(tenant_id) = access_token.tenant_id() {
-        let tenant = server.tenant(tenant_id).await?;
-        if let Some(quotas) = tenant
-            .quota_objects
-            .as_ref()
-            .map(|quotas| quotas.get(quota))
-            .filter(|quota| *quota != u32::MAX)
-        {
-            let (object_type, type_filter, description) = match quota {
-                TenantStorageQuota::MaxAccounts => {
-                    (ObjectType::Account, Some(AccountType::User), "accounts")
-                }
-                TenantStorageQuota::MaxGroups => {
-                    (ObjectType::Account, Some(AccountType::Group), "groups")
-                }
-                TenantStorageQuota::MaxDomains => (ObjectType::Domain, None, "domains"),
-                TenantStorageQuota::MaxMailingLists => {
-                    (ObjectType::MailingList, None, "mailing lists")
-                }
-                TenantStorageQuota::MaxRoles => (ObjectType::Role, None, "roles"),
-                TenantStorageQuota::MaxOauthClients => {
-                    (ObjectType::OAuthClient, None, "OAuth clients")
-                }
-                TenantStorageQuota::MaxDkimKeys => (ObjectType::DkimSignature, None, "DKIM keys"),
-                TenantStorageQuota::MaxDnsServers => (ObjectType::DnsServer, None, "DNS servers"),
-                TenantStorageQuota::MaxDirectories => (ObjectType::Directory, None, "directories"),
-                TenantStorageQuota::MaxAcmeProviders => {
-                    (ObjectType::AcmeProvider, None, "ACME providers")
-                }
-                TenantStorageQuota::MaxDiskQuota => unreachable!(),
-            };
-            let query = RegistryQuery::new(object_type).with_tenant(tenant_id.into());
-            let count = if let Some(type_filter) = type_filter {
-                server
-                    .registry()
-                    .query::<Vec<Id>>(query.equal(Property::Type, type_filter.to_id()))
-                    .await?
-                    .len() as u32
-            } else {
-                server
-                    .registry()
-                    .query::<RegistryObjectCounter>(query)
-                    .await?
-                    .0 as u32
-            };
-
-            if count >= quotas {
-                return Ok(Err(SetError::over_quota().with_description(format!(
-                    "You have exceeded your quota of {} {}.",
-                    quotas, description
-                ))));
-            }
-        }
+    if let Some(tenant_id) = tenant_id
+        && let Some(reached) = server.tenant_quota_reached(tenant_id, quota).await?
+    {
+        return Ok(Err(SetError::over_quota().with_description(format!(
+            "You have exceeded your quota of {} {}.",
+            reached.limit, reached.objects
+        ))));
     }
 
     Ok(Ok(ObjectResponse::default()))
 }
 // SPDX-SnippetEnd
-
-#[cfg(not(feature = "enterprise"))]
-pub async fn validate_tenant_quota(
-    _server: &Server,
-    _access_token: &AccessToken,
-    _quota: TenantStorageQuota,
-) -> ValidationResult {
-    ValidationResult::Ok(Ok(ObjectResponse::default()))
-}
 
 pub async fn schedule_account_destruction(
     server: &Server,
@@ -459,9 +474,25 @@ pub async fn schedule_account_destruction(
     #[cfg(not(feature = "enterprise"))]
     let status = TaskStatus::now();
 
-    let (account_domain_id, account_name, account_type) = match account {
-        Account::User(account) => (account.domain_id, account.name.clone(), AccountType::User),
-        Account::Group(account) => (account.domain_id, account.name.clone(), AccountType::Group),
+    let (account_domain_id, account_name, account_type, member_group_ids) = match account {
+        Account::User(account) => (
+            account.domain_id,
+            account.name.clone(),
+            AccountType::User,
+            account.member_group_ids.clone(),
+        ),
+        Account::Group(account) => (
+            account.domain_id,
+            account.name.clone(),
+            AccountType::Group,
+            Default::default(),
+        ),
+        Account::Resource(account) => (
+            account.domain_id,
+            account.name.clone(),
+            AccountType::Resource,
+            Default::default(),
+        ),
     };
 
     let mut batch = BatchBuilder::new();
@@ -470,11 +501,11 @@ pub async fn schedule_account_destruction(
         account_id,
         account_name,
         account_type,
+        member_group_ids,
         status,
     }));
 
-    server.store().write(batch.build_all()).await?;
-    server.notify_task_queue();
+    server.commit_batch(batch).await?;
 
     Ok(())
 }
@@ -517,15 +548,136 @@ async fn restore_account_id(server: &Server, id: u32) -> trc::Result<()> {
         );
         let last_id = server
             .store()
-            .write(id_batch.build_all())
-            .await
-            .and_then(|v| v.last_counter_id())?;
+            .write_batch(&mut id_batch)
+            .await?
+            .last_counter_id();
 
         if last_id < id as i64 {
             return Err(trc::StoreEvent::UnexpectedError
                 .into_err()
                 .details("Failed to update id counter")
                 .caused_by(trc::location!()));
+        }
+    }
+
+    Ok(())
+}
+
+const RESOURCE_DELEGATE_RIGHTS: Bitmap<Acl> = Bitmap::from_bits(
+    (1 << Acl::Read as u64)
+        | (1 << Acl::ReadItems as u64)
+        | (1 << Acl::AddItems as u64)
+        | (1 << Acl::ModifyItems as u64)
+        | (1 << Acl::RemoveItems as u64)
+        | (1 << Acl::ModifyRSVP as u64)
+        | (1 << Acl::SchedulingReadFreeBusy as u64)
+        | (1 << Acl::SchedulingReply as u64),
+);
+const MAX_DELEGATE_WRITE_ATTEMPTS: usize = 3;
+
+pub struct ResourceDelegates {
+    resource_id: u32,
+    delegates: Vec<u32>,
+}
+
+impl ResourceDelegates {
+    pub fn reconcile(resource_id: Id, account: &Account) -> Option<Self> {
+        let Account::Resource(account) = account else {
+            return None;
+        };
+        Some(ResourceDelegates {
+            resource_id: resource_id.document_id(),
+            delegates: account.delegate_ids.iter().map(Id::document_id).collect(),
+        })
+    }
+
+    pub fn resource_id(&self) -> u32 {
+        self.resource_id
+    }
+
+    fn apply_to(&self, acls: &mut Vec<AclGrant>) {
+        acls.retain_mut(|grant| {
+            if self.delegates.contains(&grant.account_id) {
+                grant.grants.union(&RESOURCE_DELEGATE_RIGHTS);
+                true
+            } else {
+                grant.grants != RESOURCE_DELEGATE_RIGHTS
+            }
+        });
+        for &account_id in &self.delegates {
+            if !acls.iter().any(|grant| grant.account_id == account_id) {
+                acls.push(AclGrant {
+                    account_id,
+                    grants: RESOURCE_DELEGATE_RIGHTS,
+                });
+            }
+        }
+    }
+}
+
+pub async fn apply_resource_delegates(
+    server: &Server,
+    access_token: &AccessToken,
+    delegates: &ResourceDelegates,
+) -> trc::Result<()> {
+    let account_id = delegates.resource_id;
+    let resource = server
+        .account(account_id)
+        .await
+        .caused_by(trc::location!())?;
+    let Some(calendar_id) = server
+        .get_or_create_default_calendar(&resource, &resource)
+        .await
+        .caused_by(trc::location!())?
+    else {
+        return Ok(());
+    };
+
+    for attempt in 1..=MAX_DELEGATE_WRITE_ATTEMPTS {
+        let Some(calendar_) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                account_id,
+                Collection::Calendar,
+                calendar_id,
+            ))
+            .await
+            .caused_by(trc::location!())?
+        else {
+            return Ok(());
+        };
+        let calendar = calendar_
+            .to_unarchived::<Calendar>()
+            .caused_by(trc::location!())?;
+        let mut new_calendar = calendar
+            .deserialize::<Calendar>()
+            .caused_by(trc::location!())?;
+        delegates.apply_to(&mut new_calendar.acls);
+        if new_calendar.acls.len() == calendar.inner.acls.len()
+            && calendar
+                .inner
+                .acls
+                .iter()
+                .zip(new_calendar.acls.iter())
+                .all(|(current, new)| current == new)
+        {
+            return Ok(());
+        }
+
+        let mut batch = BatchBuilder::new();
+        new_calendar
+            .update(
+                access_token.changed_by(),
+                calendar,
+                account_id,
+                calendar_id,
+                &mut batch,
+            )
+            .caused_by(trc::location!())?;
+        match server.commit_batch(batch).await {
+            Ok(_) => return Ok(()),
+            Err(err) if err.is_assertion_failure() && attempt < MAX_DELEGATE_WRITE_ATTEMPTS => {}
+            Err(err) => return Err(err.caused_by(trc::location!())),
         }
     }
 

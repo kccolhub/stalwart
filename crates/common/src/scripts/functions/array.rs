@@ -4,11 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::collections::{HashMap, HashSet};
-
+use ahash::{AHashMap, AHashSet};
 use sieve::{Context, runtime::Variable};
+use smallvec::SmallVec;
 
-pub fn fn_count<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
+const MAX_PRESIZE: usize = 2048;
+const LINEAR_DEDUP_MAX: usize = 16;
+
+pub fn fn_count<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
     match &v[0] {
         Variable::Array(a) => a.len(),
         v => {
@@ -22,34 +25,75 @@ pub fn fn_count<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
     .into()
 }
 
-pub fn fn_sort<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
+pub fn fn_sort<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
     let is_asc = v[1].to_bool();
-    let mut arr = (*v[0].to_array()).clone();
+    let mut arr = v[0].to_array().into_owned();
     if is_asc {
         arr.sort_unstable();
     } else {
         arr.sort_unstable_by(|a, b| b.cmp(a));
     }
-    arr.into()
+    Variable::Array(arr.into())
 }
 
-pub fn fn_dedup<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
+pub fn fn_dedup<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
     let arr = v[0].to_array();
-    let mut result = Vec::with_capacity(arr.len());
+    let capacity = arr.len().min(MAX_PRESIZE);
+    let mut result = Vec::with_capacity(capacity);
 
-    for item in arr.iter() {
-        if !result.contains(item) {
-            result.push(item.clone());
+    if arr.len() <= LINEAR_DEDUP_MAX {
+        let mut seen: SmallVec<[DedupKey<'_>; LINEAR_DEDUP_MAX]> = SmallVec::new();
+        for item in arr.iter() {
+            let key = DedupKey::from(item);
+            if !seen.contains(&key) {
+                seen.push(key);
+                result.push(item.clone());
+            }
+        }
+    } else {
+        let mut seen = AHashSet::with_capacity(capacity);
+        for item in arr.iter() {
+            if seen.insert(DedupKey::from(item)) {
+                result.push(item.clone());
+            }
         }
     }
 
     result.into()
 }
 
-pub fn fn_cosine_similarity<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
-    let mut word_freq: HashMap<Variable, [u32; 2]> = HashMap::new();
+#[derive(PartialEq, Eq, Hash)]
+enum DedupKey<'a> {
+    Text(&'a str),
+    Integer(i64),
+    Float(u64),
+    Array(&'a [Variable<'a>]),
+}
 
-    for (idx, var) in v.into_iter().enumerate() {
+impl<'a> From<&'a Variable<'a>> for DedupKey<'a> {
+    fn from(value: &'a Variable<'a>) -> Self {
+        match value {
+            Variable::String(text) => DedupKey::Text(text),
+            Variable::Integer(number) => DedupKey::Integer(*number),
+            Variable::Float(number) => DedupKey::Float(number.to_bits()),
+            Variable::Array(items) => DedupKey::Array(items),
+        }
+    }
+}
+
+pub fn fn_cosine_similarity<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
+    let mut word_freq: AHashMap<Variable, [u32; 2]> = AHashMap::with_capacity(
+        v.iter()
+            .map(|var| match var {
+                Variable::Array(l) => l.len(),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or_default()
+            .min(MAX_PRESIZE),
+    );
+
+    for (idx, var) in v.iter().enumerate() {
         match var {
             Variable::Array(l) => {
                 for item in l.iter() {
@@ -83,7 +127,8 @@ pub fn fn_cosine_similarity<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variabl
 }
 
 pub fn cosine_similarity(a: &[&str], b: &[&str]) -> f64 {
-    let mut word_freq: HashMap<&str, [u32; 2]> = HashMap::new();
+    let mut word_freq: AHashMap<&str, [u32; 2]> =
+        AHashMap::with_capacity(a.len().max(b.len()).min(MAX_PRESIZE));
 
     for (idx, items) in [a, b].into_iter().enumerate() {
         for item in items {
@@ -108,10 +153,10 @@ pub fn cosine_similarity(a: &[&str], b: &[&str]) -> f64 {
     }
 }
 
-pub fn fn_jaccard_similarity<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
-    let mut word_freq = [HashSet::new(), HashSet::new()];
+pub fn fn_jaccard_similarity<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
+    let mut word_freq = [AHashSet::new(), AHashSet::new()];
 
-    for (idx, var) in v.into_iter().enumerate() {
+    for (idx, var) in v.iter().enumerate() {
         match var {
             Variable::Array(l) => {
                 for item in l.iter() {
@@ -137,7 +182,7 @@ pub fn fn_jaccard_similarity<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variab
     .into()
 }
 
-pub fn fn_is_intersect<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
+pub fn fn_is_intersect<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
     match (&v[0], &v[1]) {
         (Variable::Array(a), Variable::Array(b)) => a.iter().any(|x| b.contains(x)),
         (Variable::Array(a), item) | (item, Variable::Array(a)) => a.contains(item),
@@ -146,14 +191,19 @@ pub fn fn_is_intersect<'x>(_: &'x Context<'x>, v: Vec<Variable>) -> Variable {
     .into()
 }
 
-pub fn fn_winnow<'x>(_: &'x Context<'x>, mut v: Vec<Variable>) -> Variable {
-    match v.remove(0) {
+pub fn fn_winnow<'x>(_: &Context<'x>, v: &[Variable<'x>]) -> Variable<'x> {
+    match &v[0] {
         Variable::Array(a) => a
             .iter()
             .filter(|i| !i.is_empty())
             .cloned()
             .collect::<Vec<_>>()
             .into(),
-        v => v,
+        v => v.clone(),
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/common/src/scripts/functions/array/tests.rs"]
+mod tests;

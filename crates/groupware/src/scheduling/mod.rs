@@ -9,18 +9,19 @@ use ahash::{AHashMap, AHashSet};
 use calcard::{
     common::{IanaString, PartialDateTime},
     icalendar::{
-        ICalendar, ICalendarComponent, ICalendarDuration, ICalendarEntry, ICalendarMethod,
-        ICalendarParameter, ICalendarParticipationRole, ICalendarParticipationStatus,
-        ICalendarPeriod, ICalendarProperty, ICalendarRecurrenceRule,
-        ICalendarScheduleForceSendValue, ICalendarStatus, ICalendarUserTypes, ICalendarValue, Uri,
+        ICalendarComponent, ICalendarDuration, ICalendarEntry, ICalendarMethod, ICalendarParameter,
+        ICalendarParticipationRole, ICalendarParticipationStatus, ICalendarPeriod,
+        ICalendarProperty, ICalendarRecurrenceRule, ICalendarScheduleForceSendValue,
+        ICalendarStatus, ICalendarUserTypes, ICalendarValue, Uri,
     },
 };
 use indexmap::IndexSet;
 use registry::schema::structs::TaskCalendarItipContents;
-use std::{fmt::Display, hash::Hash};
+use std::{cmp::Ordering, fmt::Display, hash::Hash};
 use utils::sanitize_email;
 
 pub mod attendee;
+pub mod busy_status;
 pub mod event_cancel;
 pub mod event_create;
 pub mod event_update;
@@ -28,16 +29,17 @@ pub mod format;
 pub mod inbound;
 pub mod itip;
 pub mod organizer;
+pub mod recipient;
 pub mod snapshot;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItipSnapshots<'x> {
     pub organizer: Organizer<'x>,
     pub uid: &'x str,
     pub components: AHashMap<InstanceId, ItipSnapshot<'x>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItipSnapshot<'x> {
     pub comp_id: u16,
     pub comp: &'x ICalendarComponent,
@@ -46,17 +48,18 @@ pub struct ItipSnapshot<'x> {
     pub entries: ItipEntries<'x>,
     pub sequence: Option<i64>,
     pub request_status: Vec<&'x str>,
+    pub recurrence_time: Option<ItipTime>,
 }
 
 pub type ItipEntries<'x> = IndexSet<ItipEntry<'x>, ahash::RandomState>;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ItipEntry<'x> {
     pub name: &'x ICalendarProperty,
     pub value: ItipEntryValue<'x>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ItipEntryValue<'x> {
     DateTime(ItipDateTime<'x>),
     Period(&'x ICalendarPeriod),
@@ -67,7 +70,7 @@ pub enum ItipEntryValue<'x> {
     Integer(i64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItipDateTime<'x> {
     pub date: &'x PartialDateTime,
     pub tz_id: Option<&'x str>,
@@ -75,20 +78,20 @@ pub struct ItipDateTime<'x> {
     pub timestamp: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InstanceId {
     Main,
     Recurrence(RecurrenceId),
 }
 
-#[derive(Debug, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 pub struct RecurrenceId {
     pub entry_id: u16,
     pub date: i64,
     pub this_and_future: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Attendee<'x> {
     pub entry_id: u16,
     pub email: Email,
@@ -104,7 +107,7 @@ pub struct Attendee<'x> {
     pub force_send: Option<&'x ICalendarScheduleForceSendValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Organizer<'x> {
     pub entry_id: u16,
     pub email: Email,
@@ -113,7 +116,7 @@ pub struct Organizer<'x> {
     pub force_send: Option<&'x ICalendarScheduleForceSendValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Email {
     pub email: String,
     pub is_local: bool,
@@ -140,6 +143,7 @@ pub enum ItipError {
     OutOfSequence,
     OrganizerIsLocalAddress,
     SenderIsNotOrganizerNorAttendee,
+    SenderIsNotOrganizer,
     SenderIsNotParticipant(String),
     UnknownParticipant(String),
     UnsupportedMethod(ICalendarMethod),
@@ -149,6 +153,7 @@ pub enum ItipError {
     QuotaExceeded,
     NoDefaultCalendar,
     AutoAddDisabled,
+    TooManyRecipients,
 }
 
 #[derive(Debug)]
@@ -190,10 +195,31 @@ pub enum ItipValue {
     Participants(Vec<ItipParticipant>),
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItipTime {
     pub start: i64,
     pub tz_id: u16,
+    #[serde(default)]
+    pub kind: ItipTimeKind,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+pub enum ItipTimeKind {
+    #[default]
+    DateTime,
+    Date,
+}
+
+impl ItipTimeKind {
+    pub fn of(date: &PartialDateTime) -> Self {
+        if date.has_time() {
+            ItipTimeKind::DateTime
+        } else {
+            ItipTimeKind::Date
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -211,7 +237,6 @@ impl Attendee<'_> {
     pub fn send_invite_messages(&self) -> bool {
         !self.email.is_local
             && self.is_server_scheduling
-            && self.rsvp.is_none_or(|rsvp| rsvp)
             && (self.force_send.is_some()
                 || self.part_stat.is_none_or(|part_stat| {
                     part_stat == &ICalendarParticipationStatus::NeedsAction
@@ -221,7 +246,6 @@ impl Attendee<'_> {
     pub fn send_update_messages(&self) -> bool {
         !self.email.is_local
             && self.is_server_scheduling
-            && self.rsvp.is_none_or(|rsvp| rsvp)
             && (self.force_send.is_some()
                 || self
                     .part_stat
@@ -257,21 +281,6 @@ impl Email {
             None
         }
     }
-}
-
-pub fn ical_size(ical: &ICalendar) -> usize {
-    struct SizeWriter(usize);
-
-    impl std::fmt::Write for SizeWriter {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.0 += text.len();
-            Ok(())
-        }
-    }
-
-    let mut writer = SizeWriter(0);
-    let _ = ical.write_to(&mut writer);
-    writer.0
 }
 
 impl PartialEq for Attendee<'_> {
@@ -328,10 +337,43 @@ impl PartialEq for RecurrenceId {
 
 impl Eq for RecurrenceId {}
 
+impl Ord for RecurrenceId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.date, self.this_and_future).cmp(&(other.date, other.this_and_future))
+    }
+}
+
+impl PartialOrd for RecurrenceId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Hash for RecurrenceId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.date.hash(state);
         self.this_and_future.hash(state);
+    }
+}
+
+impl Ord for ItipParticipant {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.is_organizer, other.is_organizer) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => match (self.name.as_deref(), other.name.as_deref()) {
+                (Some(name), Some(other_name)) => name
+                    .cmp(other_name)
+                    .then_with(|| self.email.cmp(&other.email)),
+                _ => self.email.cmp(&other.email),
+            },
+        }
+    }
+}
+
+impl PartialOrd for ItipParticipant {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -356,7 +398,7 @@ impl ItipDateTime<'_> {
                 .tz_id
                 .map(|tz_id| vec![ICalendarParameter::tzid(tz_id.to_string())])
                 .unwrap_or_default(),
-            values: vec![ICalendarValue::PartialDateTime(Box::new(self.date.clone()))],
+            values: [ICalendarValue::PartialDateTime(self.date.clone())].into(),
         }
     }
 }
@@ -381,6 +423,7 @@ impl ItipError {
                 | ItipError::OutOfSequence
                 | ItipError::UnknownParticipant(_)
                 | ItipError::UnsupportedMethod(_)
+                | ItipError::TooManyRecipients
         )
     }
 }
@@ -427,6 +470,7 @@ impl Display for ItipError {
             ItipError::SenderIsNotOrganizerNorAttendee => {
                 write!(f, "Sender is neither organizer nor attendee")
             }
+            ItipError::SenderIsNotOrganizer => write!(f, "Sender is not the organizer"),
             ItipError::UnknownParticipant(participant) => {
                 write!(f, "Unknown participant: {}", participant)
             }
@@ -444,6 +488,10 @@ impl Display for ItipError {
             ItipError::AutoAddDisabled => {
                 write!(f, "Auto-adding events is disabled for this account")
             }
+            ItipError::TooManyRecipients => write!(
+                f,
+                "The number of scheduling message recipients exceeds the maximum allowed."
+            ),
         }
     }
 }

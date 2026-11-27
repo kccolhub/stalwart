@@ -5,14 +5,14 @@
  */
 
 use crate::{
-    Core, Server,
+    BuildServer, Core, Server,
     config::{
         server::{Listeners, tls::parse_certificates},
         storage::Storage,
         telemetry::Telemetry,
     },
     ipc::{QueueEvent, RegistryChange},
-    network::security::{BlockedIps, IpWithTtl},
+    network::security::BlockedIps,
 };
 use ahash::AHashMap;
 use directory::Directories;
@@ -23,6 +23,9 @@ use registry::{
 use std::sync::Arc;
 use store::{LookupStores, registry::bootstrap::Bootstrap, write::now};
 
+#[cfg(feature = "enterprise")]
+use store::Store;
+
 pub struct ReloadResult {
     pub errors: Vec<Error>,
     pub warnings: Vec<Warning>,
@@ -31,6 +34,16 @@ pub struct ReloadResult {
 
 impl Server {
     pub async fn reload_registry(&self, change: RegistryChange) -> trc::Result<ReloadResult> {
+        let result = Box::pin(self.reload(change)).await;
+        if change.object() == ObjectType::SpamClassifier
+            && let Err(err) = self.inner.build_server().spam_model_reload().await
+        {
+            trc::error!(err.details("Failed to reload spam classifier model"));
+        }
+        result
+    }
+
+    async fn reload(&self, change: RegistryChange) -> trc::Result<ReloadResult> {
         let mut bootstrap = Bootstrap::new(self.registry().clone()).await;
         let object = match change {
             RegistryChange::Insert(id) => {
@@ -43,14 +56,11 @@ impl Server {
                             .unwrap_or(u64::MAX);
 
                         if expires_at > now() {
-                            let mut ips = self.inner.data.blocked_ips.write();
-                            if let Some(ip) = ip.address.try_to_ip() {
-                                ips.blocked_ip_addresses
-                                    .insert(IpWithTtl::new(ip, expires_at));
-                            } else {
-                                ips.blocked_ip_networks
-                                    .push(IpWithTtl::new(ip.address, expires_at));
-                            }
+                            self.inner
+                                .data
+                                .blocked_ips
+                                .write()
+                                .block(ip.address, expires_at);
                         }
                     }
                     return Ok(bootstrap.into());
@@ -98,14 +108,40 @@ impl Server {
             _ => {
                 // Load stores
                 let directory = Directories::build(&mut bootstrap).await;
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                let (metrics, tracing) = if self.core.is_enterprise_edition() {
+                    (
+                        self.core.storage.metrics.clone(),
+                        self.core.storage.tracing.clone(),
+                    )
+                } else {
+                    (
+                        Store::build_metrics(&mut bootstrap)
+                            .await
+                            .unwrap_or_default(),
+                        Store::build_tracing(&mut bootstrap)
+                            .await
+                            .unwrap_or_default(),
+                    )
+                };
+                // SPDX-SnippetEnd
                 let storage = &self.core.storage;
                 let storage = Storage {
                     registry: storage.registry.clone(),
-                    data: storage.data.clone(),
+                    data: bootstrap.data_store.clone(),
                     blob: storage.blob.clone(),
                     search: storage.search.clone(),
-                    metrics: storage.metrics.clone(),
-                    tracing: storage.tracing.clone(),
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
+                    metrics,
+                    #[cfg(feature = "enterprise")]
+                    tracing,
+                    // SPDX-SnippetEnd
                     memory: storage.memory.clone(),
                     coordinator: storage.coordinator.clone(),
                     directory: directory.default_directory,
@@ -113,10 +149,15 @@ impl Server {
                 };
 
                 // Parse tracers
-                let tracers = Telemetry::parse(&mut bootstrap, &storage).await;
+                let tracers = Telemetry::parse(
+                    &mut bootstrap,
+                    &storage,
+                    self.inner.ipc.index_queue_notify(),
+                )
+                .await;
 
                 if bootstrap.errors.is_empty() {
-                    let core = Box::pin(Core::parse(&mut bootstrap, storage)).await;
+                    let core = Core::parse(&mut bootstrap, storage).await;
 
                     if bootstrap.errors.is_empty() {
                         let mut servers = Listeners::parse(&mut bootstrap).await;
@@ -147,6 +188,7 @@ impl Server {
                                 .await
                                 .ok();
 
+                            bootstrap.log_notices();
                             return Ok(ReloadResult {
                                 errors: bootstrap.errors,
                                 warnings: bootstrap.warnings,
@@ -158,6 +200,7 @@ impl Server {
             }
         }
 
+        bootstrap.log_notices();
         Ok(bootstrap.into())
     }
 }
