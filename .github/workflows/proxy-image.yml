@@ -2,6 +2,11 @@ name: Build proxy-enabled image
 
 on:
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Versioned GHCR tag, for example proxy-v1.2.1-amd64
+        required: true
+        type: string
   push:
     tags:
       - "proxy-v*"
@@ -15,6 +20,16 @@ jobs:
     name: Build and publish GHCR image
     runs-on: ubuntu-latest
     steps:
+      - name: Validate manual image tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ ! "$IMAGE_TAG" =~ ^proxy-v[0-9]+\.[0-9]+\.[0-9]+-amd64$ ]]; then
+            echo 'Use a versioned proxy-vX.Y.Z-amd64 tag.' >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -38,7 +53,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=tag
-            type=raw,value=proxy,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
